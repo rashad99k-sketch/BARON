@@ -1,0 +1,18 @@
+# Secrets — never commit credentials
+.env
+.env.*
+*.secret
+
+# Virtual environments / caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime / logs
+*.log
+logs/
+botstate/
+runtime*

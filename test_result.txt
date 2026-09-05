@@ -1,0 +1,203 @@
+
+=== test_atom_intelligence.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_atom_management.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_atom_runtime.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_client_order_id.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_compile.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_core_import_smoke.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_dashboard_contracts.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_dashboard_import.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_dashboard_import_smoke.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_decision_journal.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_deep_scanner_runtime.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_deep_universe.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_dynamic_pipeline.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_early_entry_confluence.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_early_entry_confluence_engine.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_early_institutional_radar.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_early_prepared_queue.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_evidence_wiring.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_external_intelligence.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_external_providers.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_institutional_queue.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_market_data_audit.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_market_sessions.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_news_service.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_news_slot_production.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_ob_asset_config.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_ob_causal_confirmation.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_ob_quality_gates.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_open_timeout_recovery.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_orderbook_side_identification.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_pipeline_accounting.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_portfolio_dynamic_6way.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_portfolio_full_cycle.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_portfolio_isolation.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_portfolio_risk.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_position_management_phase1.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_position_side.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_position_side_lifecycle.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_pre_expansion.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_profit_engine_phase3.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_radar_position_lifecycle.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_regressions.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_release_blocker_repairs.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_runtime_repairs.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_security_controls.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_slot_execution.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_smart_validation.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_sniper_enrichment.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_trade_intelligence.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+=== test_zone_lifecycle_waves.py ===
+/home/codespace/.python/current/bin/python: No module named pytest
+
+ISOLATED TEST FILES: 0/50 passed
+FAILED FILES:
+ - test_atom_intelligence.py
+ - test_atom_management.py
+ - test_atom_runtime.py
+ - test_client_order_id.py
+ - test_compile.py
+ - test_core_import_smoke.py
+ - test_dashboard_contracts.py
+ - test_dashboard_import.py
+ - test_dashboard_import_smoke.py
+ - test_decision_journal.py
+ - test_deep_scanner_runtime.py
+ - test_deep_universe.py
+ - test_dynamic_pipeline.py
+ - test_early_entry_confluence.py
+ - test_early_entry_confluence_engine.py
+ - test_early_institutional_radar.py
+ - test_early_prepared_queue.py
+ - test_evidence_wiring.py
+ - test_external_intelligence.py
+ - test_external_providers.py
+ - test_institutional_queue.py
+ - test_market_data_audit.py
+ - test_market_sessions.py
+ - test_news_service.py
+ - test_news_slot_production.py
+ - test_ob_asset_config.py
+ - test_ob_causal_confirmation.py
+ - test_ob_quality_gates.py
+ - test_open_timeout_recovery.py
+ - test_orderbook_side_identification.py
+ - test_pipeline_accounting.py
+ - test_portfolio_dynamic_6way.py
+ - test_portfolio_full_cycle.py
+ - test_portfolio_isolation.py
+ - test_portfolio_risk.py
+ - test_position_management_phase1.py
+ - test_position_side.py
+ - test_position_side_lifecycle.py
+ - test_pre_expansion.py
+ - test_profit_engine_phase3.py
+ - test_radar_position_lifecycle.py
+ - test_regressions.py
+ - test_release_blocker_repairs.py
+ - test_runtime_repairs.py
+ - test_security_controls.py
+ - test_slot_execution.py
+ - test_smart_validation.py
+ - test_sniper_enrichment.py
+ - test_trade_intelligence.py
+ - test_zone_lifecycle_waves.py
