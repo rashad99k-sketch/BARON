@@ -497,8 +497,8 @@ QUEUE_MAX_SIZE = int(os.getenv("QUEUE_MAX_SIZE", "15"))
 QUEUE_RE_EVAL_INTERVAL = int(os.getenv("QUEUE_RE_EVAL_INTERVAL", "5"))
 QUEUE_PROMOTE_INTERVAL = int(os.getenv("QUEUE_PROMOTE_INTERVAL", "30"))
 
-GLOBAL_SCAN_INTERVAL = 60 * 20
-SCANNER_V2_INTERVAL = 60 * 20
+GLOBAL_SCAN_INTERVAL = int(os.getenv("GLOBAL_SCAN_INTERVAL_SEC", "900"))
+SCANNER_V2_INTERVAL = 60 * 15
 MICRO_SCAN_INTERVAL = 5
 TOP_LIQUID_COUNT = 80
 
@@ -7410,6 +7410,51 @@ def _live_entry_context(symbol, fallback_price, fallback_atr):
     return price, atr
 
 
+# ---- Structured execution blocker taxonomy (forensic RC#5) ----
+# Every execution rejection in execute_entry records a canonical, machine-readable
+# reason so the dashboard / pipeline accounting can explain exactly why a
+# candidate was blocked instead of a silent return False.
+EXEC_BLOCKER_TAXONOMY = (
+    "ADX_REJECT", "SESSION_REJECT", "NEWS_REJECT", "SPREAD_REJECT",
+    "RISK_REJECT", "ALLOCATOR_REJECT", "CAPACITY_REJECT", "COOLDOWN_REJECT",
+    "DATA_REJECT", "SLTP_REJECT", "EXECUTION_REJECT", "MARGIN_CAP_REJECT",
+    "QTY_REJECT", "LIQUIDITY_REJECT", "ENTRY_QUALITY_REJECT",
+)
+
+
+def _record_exec_blocker(symbol, blocker, reason="", side="", score=0.0,
+                         adx=None, required_adx=None, candidate_id="", stage="EXECUTION"):
+    """Canonical structured execution-reject record consumed by dashboard and
+    pipeline accounting. Never throws; always records."""
+    try:
+        timestamp = time.time()
+        entry = {
+            "symbol": symbol, "candidate_id": candidate_id, "stage": stage,
+            "side": side, "score": round(float(score or 0), 2),
+            "adx": (round(float(adx), 2) if adx is not None else None),
+            "required_adx": required_adx,
+            "timestamp": timestamp, "reason": str(reason)[:220],
+            "blocker": blocker,
+        }
+        ledger = MEMORY.setdefault("execution_blockers", [])
+        ledger.append(entry)
+        if len(ledger) > 200:
+            del ledger[:-200]
+        # Surface on STATE so the dashboard can read the last rejection reason.
+        _st = STATE if isinstance(STATE, dict) else {}
+        _st["last_exec_blocker"] = {
+            "symbol": symbol, "blocker": blocker, "reason": str(reason)[:220],
+            "score": entry["score"], "adx": entry["adx"],
+            "required_adx": required_adx, "timestamp": timestamp,
+        }
+        try:
+            record_gate_event(symbol, stage, blocker, str(reason), side)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification):
     """Final execution gate. Strategy intelligence decides *whether* the setup
     is institutionally mature; this function remains the sole order-entry
@@ -7427,6 +7472,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         df = get_ohlcv_safe(symbol, 100)
     if not _execution_ohlcv_ok(df):
         log_execution(f"[ENTRY] No valid OHLCV for {symbol}; refusing entry", "WARN")
+        _record_exec_blocker(symbol, "DATA_REJECT",
+                             "No valid OHLCV for entry", side, score)
         return False
 
     asset_class = AssetBehaviorProfile.resolve_asset_class(symbol)
@@ -7444,6 +7491,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 log_execution(
                     f"[ENTRY] {symbol} rejected by configured session gate: "
                     f"{_session_ctx.get('state')} pair={_session_ctx.get('pair')}", "WARN")
+                _record_exec_blocker(symbol, "SESSION_REJECT",
+                                     f"session={_session_ctx.get('state')} pair={_session_ctx.get('pair')}",
+                                     side, score)
                 return False
             if _session_ctx.get("state") == "QUIET":
                 log_execution(
@@ -7461,6 +7511,10 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         adx_val = 0.0
     if not (float(cfg["min_adx"]) <= adx_val <= float(cfg["max_adx"])):
         log_execution(f"[ENTRY] {asset_class} ADX {adx_val:.1f} outside [{cfg['min_adx']},{cfg['max_adx']}]", "WARN")
+        _record_exec_blocker(symbol, "ADX_REJECT",
+                             f"ADX {adx_val:.1f} outside [{cfg['min_adx']},{cfg['max_adx']}]",
+                             side, score, adx=adx_val,
+                             required_adx=[float(cfg['min_adx']), float(cfg['max_adx'])])
         return False
 
     # Execution-layer safety gate.
@@ -7486,6 +7540,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 f"[ENTRY] {side} requires {expected_ctx}, got {liquidity_ctx} – execution blocked",
                 "WARN",
             )
+            _record_exec_blocker(symbol, "LIQUIDITY_REJECT",
+                                 f"{side} requires {expected_ctx}, got {liquidity_ctx}",
+                                 side, score, adx=adx_val)
             return False
         if SWEEP_AUTHENTICITY:
             try:
@@ -7495,6 +7552,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                         f"[ENTRY] {side} sweep on bar {sweep_bar} is FAKE – execution blocked",
                         "WARN",
                     )
+                    _record_exec_blocker(symbol, "LIQUIDITY_REJECT",
+                                         f"sweep bar {sweep_bar} is FAKE",
+                                         side, score, adx=adx_val)
                     return False
             except Exception:
                 pass
@@ -7506,6 +7566,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         directional = (side == "BUY" and float(last['close']) > float(last['open'])) or (side == "SELL" and float(last['close']) < float(last['open']))
         if not directional and body < float(atr_val or 0) * 0.25:
             log_execution(f"[NEWS_ENTRY] {symbol} lacks immediate price-direction confirmation", "WARN")
+            _record_exec_blocker(symbol, "NEWS_REJECT",
+                                 "lacks immediate price-direction confirmation",
+                                 side, score, adx=adx_val)
             return False
 
     # Rich entry snapshot: style + phase + zone behaviour + pullback/retest are
@@ -7547,6 +7610,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 log_execution(
                     f"[ENTRY_QUALITY_AUTHORITY] {symbol} {side} REJECTED: "
                     f"{qa.get('reason', '')} (quality={qa.get('quality_score', 0):.0f})", "WARN")
+                _record_exec_blocker(symbol, "ENTRY_QUALITY_REJECT",
+                                     str(qa.get('reason', ''))[:200],
+                                     side, score, adx=adx_val)
                 return False
         except Exception as gate_err:
             log_execution(
@@ -7587,6 +7653,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                 f"(committed {committed:.2f} + {margin:.2f})",
                 "WARN",
             )
+            _record_exec_blocker(symbol, "MARGIN_CAP_REJECT",
+                                 f"projected {projected:.2f} > {PORTFOLIO_MARGIN_CAP_PCT:.0%} equity {equity:.2f}",
+                                 side, score, adx=adx_val)
             return False
     notional = margin * LEVERAGE
     qty = notional / price
@@ -7766,11 +7835,16 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     min_qty = market['limits']['amount']['min']
     if qty < min_qty:
         log_execution(f"SKIP: computed qty {qty:.6f} below minimum {min_qty}", "WARN")
+        _record_exec_blocker(symbol, "QTY_REJECT",
+                             f"computed qty {qty:.6f} below minimum {min_qty}",
+                             side, score, adx=adx_val)
         return False
     precision = market['precision']['amount']
     qty = math.floor(qty / precision) * precision
     if qty <= 0:
         log_execution(f"SKIP: qty rounded to zero", "WARN")
+        _record_exec_blocker(symbol, "QTY_REJECT", "qty rounded to zero",
+                             side, score, adx=adx_val)
         return False
     log_execution(f"Position sizing final: free_balance={free_bal:.2f}, usable={balance:.2f}, classification={classification}, margin_percent={margin_percent*100:.0f}%, margin={margin:.2f}, notional={notional:.2f}, qty={qty:.6f}", "INFO")
     order = open_position(side, qty, symbol, client_order_id=None)
@@ -7839,6 +7913,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                                      classification, atr_local, force_validate=True)
         return True
     else:
+        _record_exec_blocker(symbol, "EXECUTION_REJECT",
+                             "live order open_position returned no order",
+                             side, score, adx=adx_val)
         return False
 
 # ========== INSTITUTIONAL LIQUIDITY NARRATIVE ENGINE ==========
@@ -11987,6 +12064,28 @@ class ExecutionCandidate:
     confirmation_count: int = 0
     last_confirm_signature: str = ""
     last_confirm_marker: str = ""
+    confirmation_state: str = "WAITING_TRIGGER"
+    confirmation_reason: str = "CONFIRMATION_PENDING"
+    confirmation_events: list = field(default_factory=list)
+    confirmed_trigger: str = ""
+    confirmed_event_ids: dict = field(default_factory=dict)
+    latest_adx: float = 0.0
+    latest_adx_bounds: list = field(default_factory=list)
+    ready_blocker: str = "NONE"
+    ready_blocker_reasons: dict = field(default_factory=dict)
+    ready_score_required: float = 75.0
+    first_seen: float = 0.0
+    medium_time: float = 0.0
+    precursor_time: float = 0.0
+    institutional_time: float = 0.0
+    prepared_time: float = 0.0
+    queue_time: float = 0.0
+    confirmation_1_time: float = 0.0
+    confirmation_2_time: float = 0.0
+    ready_time: float = 0.0
+    allocator_time: float = 0.0
+    execution_time: float = 0.0
+    opened_time: float = 0.0
     original_score: float = 0.0
     original_reason: str = ""
     signal_type: str = ""
@@ -12013,6 +12112,12 @@ class ExecutionCandidate:
     institutional_layers: dict = field(default_factory=dict)
     institutional_acceleration: float = 0.0
     pre_institutional_state: str = "IDLE"
+    precursor_count: int = 0
+    institutional_prepared: bool = False
+    hypothesis: str = ""
+    institutional_phase: str = "NEUTRAL"
+    institutional_zone_state: str = "ACTIVE"
+    a_grade_ready: bool = False
     news_risk_level: str = "NEUTRAL"
     news_impact_score: float = 0.0
     news_event_type: str = ""
@@ -12076,6 +12181,14 @@ class ExecutionCandidate:
             'ifvg_penalty': self.zone_metrics.ifvg_penalty,
             'evaluation_count': self.evaluation_count,
             'confirmation_count': self.confirmation_count,
+            'confirmation_state': self.confirmation_state,
+            'confirmation_reason': self.confirmation_reason,
+            'confirmed_trigger': self.confirmed_trigger,
+            'confirmation_events': list(self.confirmation_events),
+            'latest_adx': round(self.latest_adx, 2),
+            'latest_adx_bounds': list(self.latest_adx_bounds),
+            'ready_blocker': self.ready_blocker,
+            'ready_blocker_reasons': dict(self.ready_blocker_reasons),
             'gate_status': self.gate_status,
             'last_update': self.last_evaluated,
             'roro_signal': self.roro_signal,
@@ -13319,8 +13432,13 @@ class ExecutionQueue:
                 if (cand.institutional_score >= 70 and
                     cand.pre_institutional_state in ("CONFIRMED", "PRE_ENTRY_READY")):
                     df = data_fetcher(symbol)
-                    if df is not None and self._check_entry_conditions(df, cand.side, cand.atr):
+                    if df is not None and self._check_entry_conditions(df, cand.side, cand.atr, symbol):
+                        if not cand.ready_time:
+                            cand.ready_time = time.time()
                         cand.state = ExecutionState.READY
+                        cand.ready_blocker = "NONE"
+                        cand.confirmation_state = "CONFIRMED_2"
+                        cand.confirmation_reason = "CONFIRMATION_COMPLETE"
                         log_execution(f"[QUEUE] {symbol} confirmed READY with Institutional Context", "SUCCESS")
                     else:
                         cand.state = ExecutionState.WAITING_TRIGGER
@@ -13379,14 +13497,15 @@ class ExecutionQueue:
                 trigger_state = self._detect_trigger_state(df, cand.side, atr, cand.entry_price)
                 cand.evidence = dict(self._last_evidence)
                 confirm_triggers = ("MSS_CONFIRMED", "LIQUIDITY_SWEEP", "BOS_CONFIRMED", "CHOCH_CONFIRMED")
-                if trigger_state in confirm_triggers:
-                    marker = self._confirm_marker(trigger_state, cand.evidence, len(df), current_price, atr)
-                    if marker != cand.last_confirm_marker:
-                        cand.confirmation_count += 1
-                        cand.last_confirm_marker = marker
-                else:
-                    cand.confirmation_count = 0
-                    cand.last_confirm_marker = ""
+                # ---- PERSISTENT CONFIRMATION STATE MACHINE (forensic RC#1) ----
+                # Confirmation is earned over DISTINCT valid events/candles (candle
+                # identity + trigger + sweep target + price-bucket signature). A
+                # temporary one-bar loss of the trigger does NOT erase already-earned
+                # confirmation; only a genuine invalidation (zone broken / stale /
+                # decision invalid / trigger permanently invalidated) resets it.
+                # Duplicate re-polls of the same event are prevented by an event-id
+                # fingerprint so 4/2-type impossible states cannot occur.
+                self._update_confirmation(cand, trigger_state, confirm_triggers, len(df), current_price, atr)
                 metrics = ZoneMetrics(
                     order_block_quality=ob_score,
                     zone_strength=zone_score,
@@ -13628,13 +13747,97 @@ class ExecutionQueue:
                         if not getattr(self, "_early_conf_warned", False):
                             self._early_conf_warned = True
                             log_execution(f"[ATOM-EARLY] eval failed for {symbol}: {_early_eval_err}", "ERROR")
+                # ---- ADX consistency (forensic RC#4) ----
+                # Compute ADX once on the SAME closed-candle frame the queue scores
+                # and surface it on the candidate so READY and execute_entry agree
+                # on the same value/period/timeframe (both use compute_adx period 14
+                # on the 15m canonical frame). The READY decision is gated on the
+                # SAME class band execute_entry enforces, so a candidate cannot reach
+                # READY and then be newly rejected by a different ADX band below.
+                try:
+                    _adx_s = compute_adx(df)
+                    cand.latest_adx = float(_adx_s.iloc[-1]) if _adx_s is not None and len(_adx_s) else 0.0
+                except Exception:
+                    cand.latest_adx = 0.0
+                _acfg = AssetBehaviorProfile.entry_config(
+                    AssetBehaviorProfile.resolve_asset_class(cand.symbol))
+                cand.latest_adx_bounds = [float(_acfg.get("min_adx", 0)), float(_acfg.get("max_adx", 100))]
                 self._update_state(cand, current_price)
+                self._record_opportunity_lifecycle(cand)
                 self.total_evaluations += 1
                 if cand.priority_score < 30:
                     self.gate_stats["score_too_low"] += 1
                     record_gate_event(symbol, "QUEUE", "SCORE_TOO_LOW",
                                       f"zone_score={cand.priority_score:.1f} < 30", cand.side)
                     self._return_to_watchlist(symbol, "Score too low")
+
+    def _record_opportunity_lifecycle(self, cand):
+        """Canonical per-candidate opportunity lifecycle record (P1 TASK).
+
+        Maintained on MEMORY['opportunity_lifecycle'][symbol] so the dashboard
+        / pipeline accounting can compute Opportunity Survival Rate, stage
+        conversion % and stage latency for every admitted candidate.
+        """
+        try:
+            rec = MEMORY.setdefault("opportunity_lifecycle", {}).setdefault(cand.symbol, {})
+            rec.update({
+                "symbol": cand.symbol,
+                "side": cand.side,
+                "state": cand.state.value,
+                "primary_blocker": cand.ready_blocker,
+                "secondary_blockers": list(cand.ready_blocker_reasons.keys()) or None,
+                "score": round(float(cand.zone_metrics.final_zone_score), 2),
+                "institutional_score": round(float(cand.institutional_score), 2),
+                "adx": round(float(cand.latest_adx), 2),
+                "adx_bounds": list(cand.latest_adx_bounds),
+                "trigger": cand.zone_metrics.trigger_state,
+                "confirmation_count": cand.confirmation_count,
+                "zone_state": cand.zone_state,
+                "first_seen": cand.first_seen or cand.added_at,
+                "medium_time": cand.medium_time,
+                "precursor_time": cand.precursor_time,
+                "institutional_time": cand.institutional_analysis_time,
+                "prepared_time": cand.prepared_time or cand.queue_time,
+                "queue_time": cand.queue_time or cand.added_at,
+                "confirmation_1_time": cand.confirmation_1_time,
+                "confirmation_2_time": cand.confirmation_2_time,
+                "ready_time": cand.ready_time,
+                "allocator_time": cand.allocator_time,
+                "execution_time": cand.execution_time,
+                "opened_time": cand.opened_time,
+            })
+            MEMORY["opportunity_lifecycle_updated"] = time.time()
+        except Exception:
+            pass
+
+    def summarize_opportunity_lifecycle(self):
+        """Compute opportunity survival / stage-conversion / stage-latency from
+        the recorded lifecycle records (P1 TASK). Returns a dict keyed by stage."""
+        try:
+            records = list((MEMORY.get("opportunity_lifecycle") or {}).values())
+            total = len(records)
+            if not total:
+                return {"total": 0}
+            def at(stage):
+                return sum(1 for r in records if r.get(stage))
+            opened = at("opened_time")
+            return {
+                "total": total,
+                "institutional": at("institutional_time"),
+                "prepared": at("prepared_time"),
+                "queue": at("queue_time"),
+                "confirmation_1": at("confirmation_1_time"),
+                "confirmation_2": at("confirmation_2_time"),
+                "ready": at("ready_time"),
+                "allocator_accepted": at("allocator_time"),
+                "executed": opened,
+                "survival_rate_ready_to_exec": round(opened / max(1, at("ready_time")), 4),
+                "stage_conversion_conf1_to_ready": round(at("ready_time") / max(1, at("confirmation_1_time")), 4),
+                "stage_conversion_queue_to_ready": round(at("ready_time") / max(1, at("queue_time")), 4),
+                "updated": time.time(),
+            }
+        except Exception:
+            return {"total": 0, "error": True}
 
     def _zone_anchor(self, cand):
         return cand.zone_mid() if (cand.zone_low and cand.zone_high) else cand.entry_price
@@ -14383,6 +14586,93 @@ class ExecutionQueue:
             price_bucket = str(int((last_price or 0) / atr))
         return "|".join([str(trigger_state), str(bar_count), str(sweep_age), price_bucket])
 
+    def _confirm_event_id(self, cand, trigger_state, bar_count, last_price, atr=0.0):
+        """Stable event fingerprint for a confirmation event so a single
+        distinct event can never be double-counted (prevents 4/2-type states)."""
+        return self._confirm_marker(trigger_state, cand.evidence or {}, bar_count, last_price, atr)
+
+    def _confirm_invalidated(self, cand):
+        """A genuine invalidation of the setup — not a transient trigger pause —
+        that must reset all earned confirmation. NOTE: zone invalidation/staleness
+        already removes the candidate via _invalidate/_return_to_watchlist, so a
+        candidate still being evaluated here is structurally live; we only reset
+        on an explicit decision-level invalidation (invalid label) so a brief
+        trigger absence cannot erase confirmation."""
+        label = cand.decision_label or ""
+        return bool(label.startswith("INVALID"))
+
+    def _update_confirmation(self, cand, trigger_state, confirm_triggers, bar_count, last_price, atr):
+        """Persistent confirmation state machine.
+
+        WAITING_TRIGGER -> CONFIRMATION_PENDING -> CONFIRMED_1 -> CONFIRMED_2 -> READY
+
+        - A distinct event (new candle identity / trigger / sweep target / price
+          bucket) earns +1 confirmation only if it is a NEW event id
+          (duplicate-event prevention via _confirmed_event_ids).
+        - A temporary one-bar loss of the trigger does NOT reset earned
+          confirmation; it only classes the candidate back to CONFIRMATION_PENDING
+          while preserving what was already earned (confirmed_trigger + events).
+        - A genuine invalidation (invalid decision) resets confirmation to 0.
+        - If the trigger re-emerges on a NEW event, it continues from the earned
+          level (no whipsaw-to-zero).
+        """
+        if self._confirm_invalidated(cand):
+            cand.confirmation_state = "WAITING_TRIGGER"
+            cand.confirmation_reason = "CONFIRMATION_INVALIDATED"
+            cand.confirmation_count = 0
+            cand.last_confirm_marker = ""
+            cand.confirmed_trigger = ""
+            cand.confirmed_event_ids = {}
+            cand.confirmation_events = []
+            return
+
+        if trigger_state in confirm_triggers:
+            event_id = self._confirm_event_id(cand, trigger_state, bar_count, last_price, atr)
+            # New distinct event -> earn a confirmation (only if this event id is new).
+            if event_id != cand.last_confirm_marker or event_id not in cand.confirmed_event_ids:
+                # Also only count an event as new if its core evidence differs from
+                # the most recent confirmed event (bar identity primarily).
+                new_event = (not cand.confirmed_event_ids) or (event_id != cand.last_confirm_marker)
+                if new_event:
+                    if event_id not in cand.confirmed_event_ids:
+                        cand.confirmed_event_ids[event_id] = True
+                        cand.confirmation_count += 1
+                        cand.last_confirm_marker = event_id
+                        cand.confirmed_trigger = trigger_state
+                        cand.confirmation_events.append({
+                            "id": event_id, "trigger": trigger_state,
+                            "bar": bar_count, "price": float(last_price), "ts": time.time(),
+                        })
+                        if cand.confirmation_count == 1:
+                            cand.confirmation_1_time = time.time()
+                            cand.confirmation_state = "CONFIRMED_1"
+                            cand.confirmation_reason = "CONFIRMATION_PROGRESS"
+                        elif cand.confirmation_count >= 2:
+                            cand.confirmation_2_time = time.time()
+                            cand.confirmation_state = "CONFIRMED_2"
+                            cand.confirmation_reason = "CONFIRMATION_COMPLETE"
+                        if len(cand.confirmation_events) > 8:
+                            cand.confirmation_events = cand.confirmation_events[-8:]
+                else:
+                    # Same event re-polled on a new bar identity: do not inflate.
+                    cand.last_confirm_marker = event_id
+            else:
+                # Identical re-poll of the exact same event signature: no change.
+                pass
+        else:
+            # Trigger temporarily absent: preserve earned confirmation but reflect
+            # that the trigger is not currently firing (no whipsaw to zero).
+            cand.last_confirm_marker = ""
+            if cand.confirmation_count >= 2:
+                cand.confirmation_state = "CONFIRMED_2"
+                cand.confirmation_reason = "CONFIRMATION_COMPLETE"
+            elif cand.confirmation_count >= 1:
+                cand.confirmation_state = "CONFIRMED_1"
+                cand.confirmation_reason = "CONFIRMATION_PROGRESS"
+            else:
+                cand.confirmation_state = "WAITING_TRIGGER"
+                cand.confirmation_reason = "CONFIRMATION_PENDING"
+
     def _classify_decision(self, cand):
         side = cand.side
         score = cand.zone_metrics.final_zone_score
@@ -14554,11 +14844,16 @@ class ExecutionQueue:
             return False
         return True
 
-    def _check_entry_conditions(self, df, side, atr):
+    def _check_entry_conditions(self, df, side, atr, symbol=""):
         if df is None or len(df) < 20:
             return False
         adx = compute_adx(df).iloc[-1] if len(df) >= 20 else 0
-        if adx < 18:
+        # Use the SAME class-aware ADX band as the queue READY decision and the
+        # execution gate (compute_adx period 14, class entry_config min/max ADX)
+        # so fast-path READY is consistent with execute_entry (forensic RC#4).
+        ac = AssetBehaviorProfile.entry_config(
+            AssetBehaviorProfile.resolve_asset_class(str(symbol or "")))
+        if not (float(ac["min_adx"]) <= adx <= float(ac["max_adx"])):
             return False
         vol_state = classify_volume(df)
         if vol_state not in ("expansion", "spike", "normal"):
@@ -14578,6 +14873,28 @@ class ExecutionQueue:
     def _update_state(self, cand, price):
         score = cand.zone_metrics.final_zone_score
         trigger = cand.zone_metrics.trigger_state
+        in_entry_window = cand.zone_state in ("ENTRY_WINDOW", "RETEST", "ACTIVE")
+        label, composite, trap_risk = self._classify_decision(cand)
+        cand.decision_label = label
+        evidence_ok = not label.startswith("INVALID")
+        trigger_gate = trigger in ("MSS_CONFIRMED", "LIQUIDITY_SWEEP", "BOS_CONFIRMED", "CHOCH_CONFIRMED")
+
+        # READY score floor is the class-aware ready threshold. The legacy PASS
+        # floor (65) flags a structurally viable zone; READY additionally demands
+        # the higher READY floor (class ready_score, default 75). This is an
+        # INTENTIONAL two-stage semantics, made explicit by READY_SCORE_FLOOR so
+        # the dashboard never hides why a PASS candidate is not READY.
+        try:
+            _acfg = AssetBehaviorProfile.entry_config(
+                AssetBehaviorProfile.resolve_asset_class(cand.symbol))
+            ready_required = float(_acfg.get("ready_score", 75))
+            min_adx = float(_acfg.get("min_adx", 0))
+            max_adx = float(_acfg.get("max_adx", 100))
+        except Exception:
+            ready_required = 75.0
+            min_adx, max_adx = 0.0, 100.0
+        cand.ready_score_required = ready_required
+
         if self._is_a_grade(cand):
             min_confirmations = 1
             cand.decision_label = "A_GRADE_FAST"
@@ -14587,19 +14904,9 @@ class ExecutionQueue:
                 cand.decision_label = "NORMAL_CONFIRMED"
             else:
                 cand.decision_label = "NORMAL_WAITING"
-        in_entry_window = cand.zone_state in ("ENTRY_WINDOW", "RETEST", "ACTIVE")
-        label, composite, trap_risk = self._classify_decision(cand)
-        cand.decision_label = label
-        evidence_ok = not label.startswith("INVALID")
-        trigger_gate = trigger in ("MSS_CONFIRMED", "LIQUIDITY_SWEEP", "BOS_CONFIRMED", "CHOCH_CONFIRMED")
         conf_ok = cand.confirmation_count >= min_confirmations
+
         # ---- ATOM INTELLIGENCE GATE (Roro Entry -> Atom Approval) -------
-        # When the intelligence layer is live AND has evaluated this candidate,
-        # READY additionally requires Atom approval (which embeds the TREND
-        # verification and the REVERSAL-only Sniper confirmation) and forbids a
-        # hard-rejected (Fake/Broken/Stale/Over-mitigated) zone. If the layer is
-        # unavailable or the candidate was not evaluated, we fall back to the
-        # legacy gating so the engine never regresses.
         if ATOM_INTELLIGENCE_AVAILABLE and cand.atom_intel:
             atom_gate_ok = bool(cand.atom_approved) and not bool(cand.atom_hard_reject)
             atom_gate_status = ("PASS" if atom_gate_ok and not cand.atom_hard_reject
@@ -14607,33 +14914,73 @@ class ExecutionQueue:
         else:
             atom_gate_ok = True
             atom_gate_status = "N/A"
+
+        # ---- ADX band (forensic RC#4): READY must satisfy the SAME class ADX
+        # band execute_entry enforces, so READY -> execution does not newly reject
+        # on a "different" ADX requirement. ADX is never bypassed.
+        adx_ok = (min_adx <= cand.latest_adx <= max_adx) if cand.latest_adx >= 0 else False
+        adx_gate_status = ("PASS" if adx_ok
+                           else f"FAIL({cand.latest_adx:.1f}<{min_adx:.0f})" if cand.latest_adx < min_adx
+                           else f"FAIL({cand.latest_adx:.1f}>{max_adx:.0f})")
+
+        score_gate_status = "PASS" if score >= ready_required else f"FAIL({score:.1f}<{ready_required:.0f})"
         gates = {
             "confirmation": "PASS" if conf_ok else f"FAIL({cand.confirmation_count}/{min_confirmations})",
-            "score": "PASS" if score >= 65 else f"FAIL({score:.1f}<70)",
+            "score": score_gate_status,
             "trigger": "PASS" if trigger_gate else f"FAIL({trigger})",
             "zone_window": "PASS" if in_entry_window else f"FAIL({cand.zone_state})",
             "evidence": "PASS" if evidence_ok else f"FAIL({label})",
+            "adx": adx_gate_status,
             "atom": atom_gate_status,
         }
+
+        # Explicit, machine-readable primary blocker. A non-READY candidate is
+        # ALWAYS objectively blocked by something; we assign the earliest failing
+        # precondition so blocker=NONE can never appear while not READY.
         blocker = "NONE"
+        reasons = {}
+        min_adx_eff = cand.latest_adx_bounds[0] if cand.latest_adx_bounds else min_adx
         if not conf_ok:
             blocker = "CONFIRMATION"
-        elif cand.atom_hard_reject:
-            blocker = "ATOM_HARD_REJECT"
-        elif not atom_gate_ok:
-            blocker = "ATOM"
+            reasons = {"confirmation_count": cand.confirmation_count,
+                       "min_confirmations": min_confirmations}
         elif not trigger_gate:
             blocker = "TRIGGER"
-        elif score < 60:
-            blocker = "SCORE"
+            reasons = {"trigger": trigger}
+        elif not adx_ok:
+            blocker = "ADX"
+            reasons = {"adx": round(cand.latest_adx, 2),
+                       "required_adx": f"[{min_adx_eff:.0f},{max_adx:.0f}]"}
+        elif cand.atom_hard_reject:
+            blocker = "ATOM_HARD_REJECT"
+            reasons = {"atom_reasons": (cand.atom_intel or {}).get("reasons", [])[:3]}
+        elif not atom_gate_ok:
+            blocker = "ATOM"
+            reasons = {"atom_approved": bool(cand.atom_approved)}
+        elif score < ready_required:
+            # PASS-viable but below the READY floor: expose READY_SCORE_FLOOR.
+            blocker = "READY_SCORE_FLOOR"
+            reasons = {
+                "actual_score": round(score, 2),
+                "required_score": round(ready_required, 2),
+                "delta": round(score - ready_required, 2),
+                "blocker": "READY_SCORE_FLOOR",
+            }
         elif not in_entry_window:
             blocker = "ZONE_WINDOW"
+            reasons = {"zone_state": cand.zone_state}
         elif not evidence_ok:
             blocker = "EVIDENCE"
+            reasons = {"label": label}
+
+        cand.ready_blocker = blocker
+        cand.ready_blocker_reasons = reasons
         cand.gate_status = {"gates": gates, "blocker": blocker, "trigger": trigger,
                             "confirmations": cand.confirmation_count, "score": score,
                             "zone_state": cand.zone_state, "label": label,
-                            "min_confirmations": min_confirmations}
+                            "min_confirmations": min_confirmations,
+                            "ready_score_required": round(ready_required, 2),
+                            "ready_score_floor": reasons if blocker == "READY_SCORE_FLOOR" else None}
         if cand.state in (ExecutionState.WAITING_TRIGGER, ExecutionState.GOOD_ZONE) and not cand.confirmation_logged:
             cand.confirmation_logged = True
             log_execution(f"[CONFIRMATION] {cand.symbol} waiting for trigger (zone_state={cand.zone_state})", "INFO")
@@ -14653,12 +15000,18 @@ class ExecutionQueue:
             else:
                 log_execution(f"[LATENCY] {cand.symbol}: institutional_analysis_time missing", "WARN")
         if conf_ok:
-            if score >= 75 and trigger_gate and in_entry_window and evidence_ok and atom_gate_ok:
+            if (score >= ready_required and trigger_gate and in_entry_window
+                    and evidence_ok and atom_gate_ok and adx_ok):
                 was_ready = cand.state == ExecutionState.READY
                 cand.state = ExecutionState.READY
+                cand.confirmation_state = "CONFIRMED_2"
+                cand.confirmation_reason = "CONFIRMATION_COMPLETE"
+                cand.ready_blocker = "NONE"
+                cand.ready_blocker_reasons = {}
                 cand.decision = "EARLY_ENTRY" if cand.is_a_grade else "ENTRY"
                 cand.decision_reasons.append(f"READY: conf={cand.confirmation_count}/{min_confirmations}")
                 if not was_ready:
+                    cand.ready_time = time.time()
                     self.gate_stats["ready"] += 1
                     if cand.is_a_grade:
                         self.gate_stats["a_grade_ready"] += 1

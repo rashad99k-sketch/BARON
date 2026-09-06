@@ -1251,8 +1251,43 @@ def promote_to_queue():
         candidate.zone_behaviour = entry.get("zone_behaviour", "NEUTRAL")
         candidate.trade_intelligence = entry.get("trade_intelligence", {}) or {}
 
+        # ---- Lifecycle observability timestamps (P1 TASK) ----
+        candidate.first_seen = _safe_numeric(entry.get("first_seen", 0), 0) or time.time()
+        candidate.medium_time = _safe_numeric(entry.get("medium_at", entry.get("medium_time", 0)), 0)
+        candidate.precursor_time = _safe_numeric(entry.get("precursor_at", entry.get("precursor_time", 0)), 0)
+
+        # ---- Preserve institutional context through admission (forensic RC#3) ----
+        # The institutional fast-path in re_evaluate_all requires
+        # institutional_score >= 70 AND pre_institutional_state in
+        # (CONFIRMED, PRE_ENTRY_READY). The registry carries these; we must not
+        # let them be lost / zeroed during queue admission, otherwise READY can
+        # never be reached via the fast path. We copy the real registry values
+        # only (never inventing them).
+        _inst_meta = zentry if isinstance(zentry, dict) else entry
+        candidate.institutional_score = _safe_numeric(
+            _inst_meta.get("institutional_score", entry.get("institutional_score", 0)), 0)
+        inst_state = str(
+            _inst_meta.get("pre_institutional_state",
+                           entry.get("pre_institutional_state", "IDLE")))
+        # Map the radar state onto the fast-path contract (CONFIRMED stays
+        # CONFIRMED; a ready-for-entry institutional zone maps to PRE_ENTRY_READY)
+        # only when the evidence genuinely warrants it — never invented.
+        if inst_state in ("CONFIRMED", "PRE_ENTRY_READY", "BUILDING", "MONITORING"):
+            candidate.pre_institutional_state = inst_state
+        candidate.precursor_count = int(_inst_meta.get("precursor_count",
+                                                       entry.get("precursor_count", 0)) or 0)
+        candidate.institutional_prepared = bool(entry.get("institutional_prepared", is_prepared))
+        candidate.hypothesis = _inst_meta.get("hypothesis",
+                                              entry.get("pre_expansion_state", ""))
+        candidate.institutional_phase = str((entry.get("pre_expansion") or {}).get("phase", "NEUTRAL")).upper()
+        candidate.institutional_zone_state = str(
+            (zentry.get("zone_verdict", "") if isinstance(zentry, dict) else "") or candidate.zone_state)
+        candidate.a_grade_ready = bool(entry.get("a_grade_ready", is_a_grade))
+
         if queue.add_candidate(candidate):
             promoted += 1
+            candidate.queue_time = time.time()
+            candidate.prepared_time = time.time()
             entry["queue_promoted_at"] = time.time()
             admission_state = "A_GRADE_ADMITTED" if is_a_grade else "PREPARED_ADMITTED"
             entry["queue_state"] = admission_state

@@ -324,7 +324,11 @@ def _execute_ready_queue_candidate():
 
         # Global portfolio-allocator gate: rejects when class/direction caps
         # would be violated, and records the reason for dashboard explain.
-        queue_snapshot = [c.to_dict() for c in queue._candidates.values()]
+        # EXECUTED candidates are already counted as open positions via
+        # PORTFOLIO.contexts; forwarding them into the allocator snapshot would
+        # double-count capacity and wrongly cap new entries of the same class.
+        queue_snapshot = [c.to_dict() for c in queue._candidates.values()
+                          if c.state != ExecutionState.EXECUTED]
         alloc_report = ALLOCATOR.allocate(queue_snapshot + [candidate], limit=PORTFOLIO.max_positions)
         for decision in alloc_report.decisions:
             if decision.symbol == candidate["symbol"]:
@@ -343,11 +347,28 @@ def _execute_ready_queue_candidate():
                 break
 
         MEMORY["portfolio_allocation"] = alloc_report.to_dict()
+        # Lifecycle observability: allocator stage committed for this candidate.
+        try:
+            _lc = MEMORY.setdefault("opportunity_lifecycle", {}).setdefault(best.symbol, {})
+            _lc["allocator_time"] = time.time()
+            _lc["state"] = best.state.value
+            _lc["primary_blocker"] = best.ready_blocker
+        except Exception:
+            pass
         if PORTFOLIO.open_candidate(candidate):
             with queue._lock:
                 if best.symbol in queue._candidates:
                     queue._candidates[best.symbol].state = ExecutionState.EXECUTED
                     queue.total_executed += 1
+            # Lifecycle observability: execution + opened timestamps.
+            try:
+                _lc = MEMORY.setdefault("opportunity_lifecycle", {}).setdefault(best.symbol, {})
+                _lc["execution_time"] = time.time()
+                _lc["opened_time"] = time.time()
+                _lc["state"] = "EXECUTED"
+                _lc["primary_blocker"] = "NONE"
+            except Exception:
+                pass
             _exec_gate("executed")
             E.record_gate_event(best.symbol, "EXECUTION", "EXECUTED",
                                 f"priority={best.priority_score:.1f}", best.side)
@@ -435,7 +456,7 @@ def portfolio_loop(dashboard_module=None):
     last_watch_service = 0.0
     last_snapshot = 0.0
     last_queue_eval = 0.0
-    discovery_interval = float(os.getenv("GLOBAL_SCAN_INTERVAL_SEC", "1200"))
+    discovery_interval = float(os.getenv("GLOBAL_SCAN_INTERVAL_SEC", "900"))
     watch_interval = float(os.getenv("WATCHLIST_SERVICE_INTERVAL_SEC", "20"))
     snapshot_interval = float(os.getenv("SNAPSHOT_INTERVAL", "60"))
 

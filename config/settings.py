@@ -14,7 +14,7 @@ def get_settings():
         "paper_mode": as_bool(os.getenv("PAPER_MODE"), True),
         "max_open_positions": max(1, int(os.getenv("MAX_OPEN_POSITIONS", "6"))),
         "deep_scan_enabled": as_bool(os.getenv("DEEP_SCAN_ENABLED"), True),
-        "deep_scan_interval_sec": int(os.getenv("GLOBAL_SCAN_INTERVAL_SEC", os.getenv("DEEP_SCAN_INTERVAL_SEC", "1200"))),
+        "deep_scan_interval_sec": int(os.getenv("GLOBAL_SCAN_INTERVAL_SEC", os.getenv("DEEP_SCAN_INTERVAL_SEC", "900"))),
         "deep_scan_max_symbols": int(os.getenv("DEEP_WATCHLIST_SIZE", os.getenv("DEEP_SCAN_MAX_SYMBOLS", "60"))),
         "deep_scan_radar_symbols": int(os.getenv("DEEP_SCAN_RADAR_SYMBOLS", "240")),
         "radar_symbols": [x.strip() for x in os.getenv("RADAR_SYMBOLS", "").split(",") if x.strip()],

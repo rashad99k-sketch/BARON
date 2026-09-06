@@ -62,7 +62,7 @@ class DeepScanner:
         self.radar_symbols = int(os.getenv("DEEP_SCAN_RADAR_SYMBOLS", "240"))
         self.watch_batch_size = int(os.getenv("WATCHLIST_DEEP_BATCH_SIZE", "10"))
         self.watch_interval = float(os.getenv("WATCHLIST_DEEP_INTERVAL_SEC", "20"))
-        self.discovery_interval = float(os.getenv("GLOBAL_SCAN_INTERVAL_SEC", "1200"))
+        self.discovery_interval = float(os.getenv("GLOBAL_SCAN_INTERVAL_SEC", "900"))
         self.strategy = StrategyEngine()
         self.news = NewsService()
         self.last_scan = 0.0
@@ -79,7 +79,7 @@ class DeepScanner:
         self.radar_batch_interval = float(os.getenv("RADAR_BATCH_INTERVAL_SEC", "20"))
         self.radar_time_budget_sec = float(os.getenv("RADAR_TIME_BUDGET_SEC", "15"))
         self.radar_cycle_seconds = float(
-            os.getenv("RADAR_CYCLE_SECONDS", os.getenv("GLOBAL_SCAN_INTERVAL_SEC", "1200"))
+            os.getenv("RADAR_CYCLE_SECONDS", os.getenv("GLOBAL_SCAN_INTERVAL_SEC", "900"))
         )
         self.radar_max_calls_per_min = int(os.getenv("RADAR_MAX_CALLS_PER_MIN", "60"))
         self.radar_proximity_pct = float(os.getenv("RADAR_PROXIMITY_PCT", "0.0075"))

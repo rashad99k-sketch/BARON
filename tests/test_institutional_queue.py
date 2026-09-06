@@ -100,6 +100,12 @@ class InstitutionalQueueHardeningTest(unittest.TestCase):
             df=self._df(True), ob={},
         )
         cand.confirmation_count = 2
+        # Validate the ADX band the same way the queue does (forensic RC#4):
+        # execution rejects sub-band ADX, so a READY candidate must be in-band.
+        # With no in-band ADX the candidate would be blocked on ADX, not on the
+        # composite, which is precisely the mismatch the fix removes.
+        cand.latest_adx = 30.0
+        cand.latest_adx_bounds = [16.0, 55.0]
         cand.zone_metrics = self.engine.ZoneMetrics(
             order_block_quality=50, zone_strength=50, liquidity_quality=50,
             institutional_confidence=50, structure_alignment=50,
@@ -109,7 +115,8 @@ class InstitutionalQueueHardeningTest(unittest.TestCase):
         queue._update_state(cand, 100)
         self.assertNotEqual(cand.state, self.engine.ExecutionState.READY)
 
-        # when the composite reaches ≥75 with a confirmed trigger, READY fires
+        # when the composite reaches ≥75 with a confirmed trigger (and ADX in
+        # band), READY fires
         cand.zone_metrics = self.engine.ZoneMetrics(
             order_block_quality=90, zone_strength=90, liquidity_quality=80,
             institutional_confidence=85, structure_alignment=85,
