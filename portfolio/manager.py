@@ -362,30 +362,83 @@ class PortfolioManager:
         out = []
         for symbol in list(self.contexts.keys()):
             ctx = self.contexts[symbol]
-            s = ctx.state
-            out.append({
-                "symbol": symbol,
-                "side": s.get("side"),
-                "entry": s.get("entry", 0.0),
-                "mark_price": s.get("mark_price", 0.0),
-                "qty": s.get("qty", 0.0),
-                "remaining_qty": s.get("remaining_qty", 0.0),
-                "roe_pct": s.get("roe_pct", 0.0),
-                "pnl_usdt": s.get("unrealized_pnl_usdt", 0.0),
-                "sl": s.get("synthetic_sl", s.get("sl", 0.0)),
-                "tp1": s.get("synthetic_tp1", s.get("tp1_price", 0.0)),
-                "tp2": s.get("tp2_price", 0.0),
-                "tp1_hit": bool(s.get("tp1_hit", False)),
-                "tp2_hit": bool(s.get("tp2_hit", False)),
-                "trailing_active": bool(s.get("trail_activated", False)),
-                "confidence": s.get("current_confidence", 0.0),
-                "regime": s.get("market_regime", "UNKNOWN"),
-                "trade_state": s.get("trade_state", "UNKNOWN"),
-                "trade_style": s.get("trade_style", "SCALP"),
-                "entry_timing": s.get("entry_timing", "WAIT_RETEST"),
-                "market_phase": s.get("market_phase", "UNKNOWN"),
-                "zone_behaviour": s.get("zone_behaviour", "NEUTRAL"),
-                "trade_board": s.get("trade_board", {}),
-                "market_session": s.get("market_session", {}),
-            })
+            payload = canonical_position_payload(symbol, ctx.state, self._ctx_class(ctx))
+            out.append(payload)
         return out
+
+
+def canonical_position_payload(symbol: str, s: dict, asset_class: Optional[str] = None):
+    """P1 canonical portfolio-position payload. Every documented key is always
+    present; genuinely unknown values are None/0.0/False -- never the string
+    'undefined' and never fake placeholders."""
+    entry = float(s.get("entry", 0.0) or 0.0)
+    tp1 = float(s.get("synthetic_tp1", 0.0) or 0.0)
+    if tp1 <= 0:
+        tp1 = float(s.get("dynamic_tp1", 0.0) or 0.0)
+    if tp1 <= 0:
+        tp1 = float(s.get("tp1_price", 0.0) or 0.0)
+    tp2 = float(s.get("tp2_price", 0.0) or 0.0)
+    if tp2 <= 0:
+        tp2 = float(s.get("synthetic_tp2", 0.0) or 0.0)
+    intel = s.get("trade_intelligence") if isinstance(s.get("trade_intelligence"), dict) else {}
+    narrative = intel.get("narrative") or s.get("narrative_classification") or None
+    session = s.get("market_session")
+    if session is None:
+        session = {}
+    if isinstance(session, dict):
+        label = s.get("session_label") or session.get("label") or session.get("current")
+    else:
+        label = s.get("session_label")
+    return {
+        "symbol": symbol,
+        "asset_class": asset_class or PortfolioManager._asset_class(symbol),
+        "side": s.get("side"),
+        "entry": round(entry, 6),
+        "mark_price": float(s.get("mark_price", 0.0) or 0.0),
+        "current_price": float(s.get("mark_price", 0.0) or 0.0),
+        "qty": float(s.get("qty", 0.0) or 0.0),
+        "remaining_qty": float(s.get("remaining_qty", 0.0) or 0.0),
+        "pnl": float(s.get("unrealized_pnl_usdt", 0.0) or 0.0),
+        "roe": float(s.get("roe_pct", 0.0) or 0.0),
+        "roe_pct": float(s.get("roe_pct", 0.0) or 0.0),
+        "pnl_usdt": float(s.get("unrealized_pnl_usdt", 0.0) or 0.0),
+        "sl": float(s.get("synthetic_sl", s.get("sl", 0.0)) or 0.0),
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp1_done": bool(s.get("tp1_hit", False)),
+        "tp1_hit": bool(s.get("tp1_hit", False)),
+        "tp2_hit": bool(s.get("tp2_hit", False)),
+        "trailing_active": bool(s.get("trail_activated", False)),
+        "trail_stop": float(s.get("trail_stop", 0.0) or 0.0),
+        "trail_multiplier": float(s.get("smart_trail_mult", 1.5) or 1.5),
+        "delay_tp1": bool(s.get("delay_tp1", False)),
+        "location": s.get("location"),
+        "zone": s.get("zone_info"),
+        "zone_behaviour": s.get("zone_behaviour"),
+        "narrative": narrative,
+        "narrative_classification": s.get("narrative_classification"),
+        "narrative_confidence": float(s.get("narrative_confidence", 0.0) or 0.0),
+        "confidence": s.get("current_confidence"),
+        "confidence_level": s.get("confidence_level"),
+        "current_confidence": float(s.get("current_confidence", 0.0) or 0.0),
+        "regime": s.get("market_regime"),
+        "market_regime": s.get("market_regime"),
+        "trade_state": s.get("trade_state"),
+        "state": None,
+        "market_phase": s.get("market_phase"),
+        "entry_timing": s.get("entry_timing"),
+        "classification": s.get("classification"),
+        "trade_type": s.get("trade_type"),
+        "entry_type": s.get("entry_type"),
+        "trade_style": s.get("trade_style"),
+        "score": s.get("trade_score", 0),
+        "continuation_pressure": s.get("continuation_pressure", 50),
+        "board": s.get("trade_board") if isinstance(s.get("trade_board"), dict) else None,
+        "trade_board": s.get("trade_board") if isinstance(s.get("trade_board"), dict) else None,
+        "market_session": session if isinstance(session, dict) else {},
+        "session_label": label,
+        "dynamic_tp1": float(s.get("dynamic_tp1", 0.0) or 0.0),
+        "dynamic_tp2": float(s.get("dynamic_tp2", 0.0) or 0.0),
+        "entry_atr": float(s.get("entry_atr", 0.0) or 0.0),
+        "last_update_ts": s.get("last_update_ts") or s.get("entry_time"),
+    }

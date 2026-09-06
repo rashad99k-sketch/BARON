@@ -61,6 +61,35 @@ def _control_authorized():
 
 _update_position_dashboard_impl = E.update_position_dashboard
 
+_RESERVED_UNDEFINED = frozenset(("undefined", "N/A", "n/a"))
+
+
+def _normalize_payload(value, depth=0):
+    """P1 normalization: deep-clean any payload destined for JSON so no literal
+    'undefined'/'N/A' sentinel strings ever reach the browser. Numeric scalars
+    are coerced to float/int and NaN/Inf removed by safe_json downstream.
+    genuinely unknown values become None."""
+    if depth > 40:
+        return None
+    if isinstance(value, dict):
+        return {k: _normalize_payload(v, depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_payload(v, depth + 1) for v in value]
+    if isinstance(value, str):
+        if value in _RESERVED_UNDEFINED:
+            return None
+        return value
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        try:
+            if value != value or value in (float("inf"), float("-inf")):
+                return None
+        except Exception:
+            pass
+        return value
+    return value
+
 def update_position_dashboard(symbol, side, entry, qty, pnl=0.0):
     """Project the engine-owned canonical position state for the dashboard."""
     _update_position_dashboard_impl(symbol, side, entry, qty, pnl)
@@ -984,7 +1013,7 @@ fetchData();
 def data():
     cached = cache_get("dashboard", 5)
     if cached is not None:
-        return jsonify(safe_json(cached))
+        return jsonify(safe_json(_normalize_payload(cached))), 200
     try:
         bal = get_balance_safe()
         free_bal = get_free_balance_safe()
@@ -995,8 +1024,8 @@ def data():
         DASHBOARD_STATE["account"]["available_margin"] = avail_margin
         DASHBOARD_STATE["account"]["mode"] = mode
         perf = get_dashboard_metrics()
-        pos = None
-        if STATE["open"] and STATE.get("current_symbol"):
+        pos = DASHBOARD_STATE.get("position")
+        if STATE["open"] and STATE.get("current_symbol") and pos is None:
             roe = STATE.get("roe_pct", 0.0)
             pos = {
                 "symbol": STATE["current_symbol"],
@@ -1010,15 +1039,15 @@ def data():
                 "tp1_done": STATE.get("tp1_hit", False),
                 "trailing_active": STATE.get("trail_activated", False),
                 "regime": MEMORY.get("regime", "UNKNOWN"),
-                "trade_type": STATE.get("trade_type", "N/A"),
-                "entry_type": STATE.get("entry_type", "N/A"),
-                "classification": STATE.get("classification", "N/A"),
-                "location": STATE.get("location", "N/A"),
-                "zone": STATE.get("zone_info", "N/A"),
+                "trade_type": STATE.get("trade_type"),
+                "entry_type": STATE.get("entry_type"),
+                "classification": STATE.get("classification"),
+                "location": STATE.get("location"),
+                "zone": STATE.get("zone_info"),
                 "score": STATE.get("trade_score", 0),
-                "narrative_classification": STATE.get("narrative_classification", ""),
+                "narrative_classification": STATE.get("narrative_classification"),
                 "narrative_confidence": STATE.get("narrative_confidence", 0.0),
-                "confidence_level": STATE.get("confidence_level", ""),
+                "confidence_level": STATE.get("confidence_level"),
                 "current_confidence": STATE.get("current_confidence", 50.0),
                 "market_regime": STATE.get("market_regime", "UNKNOWN"),
                 "continuation_pressure": STATE.get("continuation_pressure", 50),
@@ -1026,8 +1055,6 @@ def data():
                 "trail_multiplier": STATE.get("smart_trail_mult", 1.5),
                 "delay_tp1": STATE.get("delay_tp1", False)
             }
-        else:
-            pos = DASHBOARD_STATE["position"]
         health = MEMORY["health"].copy()
         health["errors"] = len(DASHBOARD_STATE["errors"])
         top5 = MEMORY.get("top_candidates", [])[:5] if "top_candidates" in MEMORY else []
@@ -1224,7 +1251,7 @@ def data():
         # WATCHLIST -> QUEUE -> READY -> VALIDATION/RISK -> EXECUTION counters.
         payload['pipeline'] = MEMORY.get('pipeline', {})
         
-        safe_payload = safe_json(payload)
+        safe_payload = safe_json(_normalize_payload(payload))
         cache_set("dashboard", safe_payload)
         return jsonify(safe_payload), 200
     except Exception as e:
@@ -1282,12 +1309,13 @@ def execution_endpoint():
 
 @app.route("/positions")
 def positions_endpoint():
-    return jsonify({"status": "OK", "positions": safe_json(DASHBOARD_STATE.get("positions", [])),
-                    "open_positions": len(DASHBOARD_STATE.get("positions", []))}), 200
+    positions = _normalize_payload(DASHBOARD_STATE.get("positions", []))
+    return jsonify({"status": "OK", "positions": safe_json(positions),
+                    "open_positions": len(positions)}), 200
 
 @app.route("/portfolio")
 def portfolio_endpoint():
-    return jsonify(safe_json(DASHBOARD_STATE.get("portfolio", {"open_positions": 0, "max_positions": 6, "capacity": 6}))), 200
+    return jsonify(safe_json(_normalize_payload(DASHBOARD_STATE.get("portfolio", {"open_positions": 0, "max_positions": 6, "capacity": 6})))), 200
 
 @app.route("/news")
 def news_endpoint():

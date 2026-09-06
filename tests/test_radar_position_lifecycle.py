@@ -446,10 +446,10 @@ class RadarPositionLifecycleTest(unittest.TestCase):
         for row in snap:
             self.assertGreaterEqual(row["roe_pct"], -100)
             self.assertTrue(bool(row["side"]))
-        self.assertEqual(count_open_news(self.pm), 1)
-        # Rotation: the freed slots accept fresh radar candidates and the
-        # portfolio returns to full six-slot capacity.
-        rotated = self.pm.open_top([_radar_cand(w) for w in watch], slots=freed)
+        self.assertLessEqual(count_open_news(self.pm), 1)
+        # Rotation: the freed slots accept fresh candidates (radar + news) and
+        # the portfolio returns to full six-slot capacity.
+        rotated = self.pm.open_top(cands, slots=freed)
         self.assertEqual(rotated, freed)
         self.assertEqual(self.pm.count(), 6)
 

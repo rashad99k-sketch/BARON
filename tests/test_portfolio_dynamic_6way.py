@@ -51,6 +51,7 @@ PAPER_ENV = {
 _STATE_SNAPSHOT = copy.deepcopy(E.STATE)
 _TSTATE_SNAPSHOT = copy.deepcopy(E.TRADE_STATE)
 _DASH_SNAPSHOT = copy.deepcopy(E.DASHBOARD_STATE)
+_ORIG_LOG_EXECUTION = E.log_execution
 
 
 def _reset_engine():
@@ -177,6 +178,7 @@ class _PortfolioEngineTestCase(unittest.TestCase):
     def tearDown(self):
         self._liq.stop()
         self._adx.stop()
+        E.log_execution = _ORIG_LOG_EXECUTION
         for k, saved in self._env_saved.items():
             if saved is None:
                 os.environ.pop(k, None)

@@ -105,12 +105,31 @@ def sync_all_states():
 def _publish_portfolio_dashboard(dashboard_module):
     positions = PORTFOLIO.snapshot()
     E.DASHBOARD_STATE["positions"] = positions
+    perf = E.PERF if isinstance(getattr(E, "PERF", None), dict) else {}
+    total_pnl = float(perf.get("total_pnl_usdt", 0.0) or 0.0)
+    trades = int(perf.get("trades", 0) or 0)
+    wins = int(perf.get("wins", 0) or 0)
+    balance = float(E.STATE.get("initial_balance", 0.0) or 0.0)
+    if balance <= 0:
+        try:
+            balance = float(E.get_balance_safe() or 0.0)
+        except Exception:
+            balance = 0.0
     E.DASHBOARD_STATE["portfolio"] = {
         "open_positions": len(positions),
         "max_positions": PORTFOLIO.max_positions,
-        "capacity": PORTFOLIO.max_positions - len(positions),
+        "capacity": max(0, PORTFOLIO.max_positions - len(positions)),
         "asset_classes": {},
         "risk": PORTFOLIO.risk_snapshot(),
+        "total_pnl": total_pnl,
+        "equity": balance + total_pnl,
+        "balance": balance,
+        "margin": float(E.STATE.get("margin", 0.0) or 0.0),
+        "trades": trades,
+        "wins": wins,
+        "losses": trades - wins,
+        "win_rate": (wins / trades * 100) if trades else 0.0,
+        "last_update": time.time(),
     }
     for pos in positions:
         base = str(pos.get("symbol", "")).upper()
@@ -118,6 +137,8 @@ def _publish_portfolio_dashboard(dashboard_module):
         if any(x in base for x in ("XAU", "GOLD")): cls = "GOLD"
         elif any(x in base for x in ("WTI", "BRENT", "OIL", "CRUDE")): cls = "OIL"
         elif any(x in base for x in ("SPX", "SP500", "NAS", "US30", "DAX", "FTSE", "CAC", "NIKKEI")): cls = "INDEX"
+        elif str(pos.get("asset_class", "")).upper() in ("GOLD", "OIL", "INDEX", "CRYPTO", "STOCK"):
+            cls = str(pos.get("asset_class", "")).upper()
         E.DASHBOARD_STATE["portfolio"]["asset_classes"][cls] = E.DASHBOARD_STATE["portfolio"]["asset_classes"].get(cls, 0) + 1
     if positions:
         primary = positions[0]

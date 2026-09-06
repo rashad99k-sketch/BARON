@@ -136,7 +136,23 @@ class PromotionWindowTest(unittest.TestCase):
 
     def _load_scanner(self):
         sys.modules.pop("scanner.scanner", None)
+        pkg = sys.modules.get("scanner")
+        if pkg is not None:
+            pkg.scanner = None
         return importlib.import_module("scanner.scanner")
+
+    def setUp(self):
+        self._saved_scanner = sys.modules.get("scanner.scanner")
+
+    def tearDown(self):
+        mod = self._saved_scanner
+        pkg = sys.modules.get("scanner")
+        if mod is None:
+            sys.modules.pop("scanner.scanner", None)
+        else:
+            sys.modules["scanner.scanner"] = mod
+        if pkg is not None:
+            pkg.scanner = mod
 
     def _extended_frame(self):
         # Displacement moved price far ABOVE the causal OB: entry window missed.
@@ -328,6 +344,22 @@ class ReadyTransitionTest(unittest.TestCase):
 
 
 class DashboardPipelineTest(unittest.TestCase):
+    def setUp(self):
+        self._saved_scanner = sys.modules.get("scanner.scanner")
+
+    def tearDown(self):
+        self._restore_scanner()
+
+    def _restore_scanner(self):
+        mod = self._saved_scanner
+        pkg = sys.modules.get("scanner")
+        if mod is None:
+            sys.modules.pop("scanner.scanner", None)
+        else:
+            sys.modules["scanner.scanner"] = mod
+        if pkg is not None:
+            pkg.scanner = mod
+
     def test_pipeline_payload_and_live_memory(self):
         eng = sys.modules.get("core.engine")
         if eng is None:
@@ -337,12 +369,16 @@ class DashboardPipelineTest(unittest.TestCase):
             "universe": {"loaded": 100, "eligible": 50, "selected": 20},
             "radar": {"attempted": 20, "scanned": 18},
         }
-        dashboard = importlib.import_module("dashboard.app")
-        if not hasattr(dashboard.app, "test_client"):
-            self.skipTest("dashboard app not available under fake-flask harness")
-        eng.CACHE.pop("dashboard", None)
-        with dashboard.app.test_client() as client:
-            body = client.get("/data").get_json()
+        try:
+            dashboard = importlib.import_module("dashboard.app")
+            if not hasattr(dashboard.app, "test_client"):
+                self.skipTest("dashboard app not available under fake-flask harness")
+            eng.CACHE.pop("dashboard", None)
+            with dashboard.app.test_client() as client:
+                body = client.get("/data").get_json()
+        finally:
+            sys.modules.pop("dashboard.app", None)
+            self._restore_scanner()
         self.assertEqual(body["queue"]["promotions"], 5)
         self.assertIn("pipeline", body)
         self.assertEqual(body["pipeline"]["universe"]["loaded"], 100)

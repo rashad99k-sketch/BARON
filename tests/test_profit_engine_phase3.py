@@ -493,6 +493,7 @@ class IfvgSixPositionLifecycleStressTest(unittest.TestCase):
 
     def setUp(self):
         from portfolio.manager import PortfolioManager
+        self._orig_log_execution = E.log_execution
         self._env = {k: os.environ.get(k) for k in self.PAPER_ENV}
         for k, v in self.PAPER_ENV.items():
             os.environ[k] = v
@@ -518,6 +519,7 @@ class IfvgSixPositionLifecycleStressTest(unittest.TestCase):
         self._liq.stop()
         self._adx.stop()
         self._ifvg_patch.stop()
+        E.log_execution = self._orig_log_execution
         for k, saved in self._env.items():
             if saved is None:
                 os.environ.pop(k, None)

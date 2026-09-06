@@ -229,6 +229,7 @@ class SmartValidationTest(unittest.TestCase):
             S.MEMORY["stale_zone_refs"] = E.MEMORY["stale_zone_refs"]
             E.queue = saved_queue
             S.queue = saved_queue
+            _sys.modules.pop("scanner.scanner", None)
 
         self.assertGreaterEqual(promoted, 1)
         cand = q._candidates.get("Z/USDT:USDT")

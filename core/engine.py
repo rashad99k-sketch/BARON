@@ -3095,7 +3095,8 @@ PERF = {
     "trades": 0,
     "wins": 0,
     "losses": 0,
-    "last_trade": None
+    "last_trade": None,
+    "symbols": {}
 }
 
 # ========== INSTITUTIONAL TREND ENGINE ==========
@@ -3427,10 +3428,22 @@ def close_partial(ratio):
     try:
         if PAPER_MODE:
             if paper["position"]:
-                paper["position"]["remaining_qty"] *= (1-ratio)
-                STATE["remaining_qty"] *= (1-ratio)
+                entry = STATE.get("entry", 0.0) or 0.0
+                qty_init = STATE.get("qty", 0.0) or 0.0
+                closed_qty = STATE["remaining_qty"] * ratio
+                side_u = STATE.get("side")
+                mark = get_ticker_safe(STATE.get("current_symbol")) or STATE.get("mark_price") or entry
+                dirv = 1 if side_u == "BUY" else -1
+                pnl_pct_leg = dirv * (mark - entry) / entry * 100 if entry else 0.0
+                pnl_usdt_leg = pnl_pct_leg / 100 * entry * closed_qty
+                STATE["remaining_qty"] = max(0.0, STATE["remaining_qty"] - closed_qty)
+                paper["position"]["remaining_qty"] = STATE["remaining_qty"]
                 TRADE_STATE["qty"] = STATE["remaining_qty"]
-                log_execution(f"[CLOSE_PARTIAL] Paper partial close {ratio*100:.0f}%", "SUCCESS")
+                _record_partial_leg(side_u, closed_qty, mark, entry, pnl_pct_leg, pnl_usdt_leg, "PAPER")
+                released = STATE["margin"] * (closed_qty / qty_init) if qty_init > 0 else 0.0
+                paper["balance"] = paper.get("balance", 10000.0) + pnl_usdt_leg + released
+                paper["committed_margin"] = max(0.0, paper.get("committed_margin", 0.0) - released)
+                log_execution(f"[CLOSE_PARTIAL] Paper partial close {ratio*100:.0f}% | leg PnL {pnl_pct_leg:+.2f}%/{pnl_usdt_leg:+.2f} USDT | margin released {released:.2f}", "SUCCESS")
             return
 
         symbol = STATE["current_symbol"]
@@ -3453,6 +3466,21 @@ def close_partial(ratio):
 
         filled, filled_qty = verify_order_filled(symbol, order_id, side, qty_precise, timeout=10)
         if filled:
+            fill_price = 0.0
+            try:
+                fill_price = float(order.get("average") or order.get("price") or 0.0)
+            except Exception:
+                fill_price = 0.0
+            if not fill_price:
+                fill_price = float(STATE.get("mark_price") or STATE.get("entry") or 0.0)
+            _entry_p = float(STATE.get("entry", 0.0) or 0.0)
+            dirv = 1 if STATE.get("side") == "BUY" else -1
+            pnl_pct_leg = dirv * (fill_price - _entry_p) / _entry_p * 100 if _entry_p else 0.0
+            pnl_usdt_leg = pnl_pct_leg / 100 * _entry_p * filled_qty
+            _record_partial_leg(STATE.get("side"), filled_qty, fill_price, _entry_p, pnl_pct_leg, pnl_usdt_leg, "LIVE")
+            STATE["remaining_qty"] = max(0.0, STATE["remaining_qty"] - filled_qty)
+            TRADE_STATE["qty"] = STATE["remaining_qty"]
+            log_execution(f"[CLOSE_PARTIAL] LIVE leg realized: {pnl_pct_leg:+.2f}% / {pnl_usdt_leg:+.2f} USDT @ {fill_price:.6f}", "SUCCESS")
             time.sleep(1)
             pos = fetch_position(symbol)
             if pos is None:
@@ -4700,6 +4728,10 @@ class LiveTradeManager:
         except Exception as _e:
             log_execution(f"[DYNAMIC] rules error: {_e}", "WARN")
 
+        # ---- P1: single TP/SL authority + dashboard refresh (every tick) ----
+        _refresh_live_levels(entry, side, atr, symbol, classification=STATE.get("classification"))
+        publish_position_state(symbol, side, entry, STATE.get("qty", 0.0), roe)
+
         if (side == "BUY" and mark_price <= STATE.get("synthetic_sl", 0)) or (side == "SELL" and mark_price >= STATE.get("synthetic_sl", 0)):
             close_position_full()
             self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
@@ -4749,6 +4781,8 @@ def sync_position_state(symbol=None):
             STATE["remaining_qty"] = snap.qty
             STATE["current_symbol"] = symbol
             STATE["entry_time"] = time.time()
+            STATE["fill_request_price"] = snap.entry_price
+            STATE["qty_initial"] = snap.qty
             TRADE_STATE.update({
                 "in_position": True,
                 "symbol": symbol,
@@ -4758,7 +4792,10 @@ def sync_position_state(symbol=None):
                 "last_update_ts": time.time()
             })
             _live_manager.start_trade(symbol, snap.side, snap.entry_price, snap.qty, 0.0, 0.0, 0.0)
+            _reconcile_levels_after_fill(snap.entry_price, symbol, snap.side, STATE.get("trade_type"),
+                                         STATE.get("classification"), None, force_validate=True)
         else:
+            _prev_entry = STATE.get("entry", snap.entry_price)
             STATE["entry"] = snap.entry_price
             STATE["qty"] = snap.qty
             STATE["remaining_qty"] = snap.qty
@@ -4768,6 +4805,10 @@ def sync_position_state(symbol=None):
                 "qty": snap.qty,
                 "side": snap.side
             })
+            if snap.entry_price and abs(float(snap.entry_price) - float(_prev_entry)) > max(1e-12, float(_prev_entry) * 1e-6):
+                STATE["fill_request_price"] = STATE.get("fill_request_price") or _prev_entry
+                _reconcile_levels_after_fill(snap.entry_price, symbol, snap.side, STATE.get("trade_type"),
+                                             STATE.get("classification"), None, force_validate=True)
 
         STATE["margin"] = snap.margin
         STATE["unrealized_pnl_usdt"] = snap.unrealized_pnl
@@ -5862,6 +5903,7 @@ STATE = {
     "smart_trail_mult": 1.5,
     "synthetic_sl": 0.0,
     "synthetic_tp1": 0.0,
+    "synthetic_tp2": 0.0,
     "max_price": 0.0,
     "min_price": 0.0,
     "peak_roe": 0.0,
@@ -5877,7 +5919,15 @@ STATE = {
     "market_phase": "UNKNOWN",
     "zone_behaviour": "NEUTRAL",
     "trade_board": {},
-    "trade_intelligence": {}
+    "trade_intelligence": {},
+    "fill_request_price": None,
+    "qty_initial": 0.0,
+    "partial_realized": [],
+    "dynamic_tp1": 0.0,
+    "dynamic_tp2": 0.0,
+    "market_session": None,
+    "session_label": None,
+    "position_asset_class": "CRYPTO"
 }
 paper = {"balance": 10000.0, "position": None, "committed_margin": 0.0}
 _ACTIVE_TRADE = False
@@ -5897,35 +5947,133 @@ DASHBOARD_STATE = {
     "institutional_flow": {}
 }
 
-def publish_position_state(symbol, side, entry, qty, pnl=0.0):
-    DASHBOARD_STATE["position"] = {
-        "symbol": symbol,
+def _board_or_empty():
+    tb = STATE.get("trade_board")
+    return tb if isinstance(tb, dict) else None
+
+
+def _lifecycle_name():
+    try:
+        lm = _live_manager
+    except NameError:
+        return None
+    if lm is None:
+        return None
+    try:
+        return str(lm.lifecycle_state.value)
+    except Exception:
+        return None
+
+
+def _build_canonical_position_payload():
+    """P1 canonical position payload. Every documented key is always present;
+    genuinely unknown values are None/0.0/False -- never the string 'undefined'
+    and never fake placeholders. Refreshed on every management tick."""
+    entry = float(STATE.get("entry", 0.0) or 0.0)
+    side = STATE.get("side")
+    mark = float(STATE.get("mark_price", 0.0) or 0.0)
+    sl = float(STATE.get("synthetic_sl", 0.0) or 0.0)
+    tp1 = float(STATE.get("synthetic_tp1", 0.0) or 0.0)
+    if tp1 <= 0:
+        tp1 = float(STATE.get("dynamic_tp1", 0.0) or 0.0)
+    if tp1 <= 0:
+        tp1 = float(STATE.get("tp1_price", 0.0) or 0.0)
+    tp2 = float(STATE.get("tp2_price", 0.0) or 0.0)
+    if tp2 <= 0:
+        tp2 = float(STATE.get("synthetic_tp2", 0.0) or 0.0)
+    intel = STATE.get("trade_intelligence") if isinstance(STATE.get("trade_intelligence"), dict) else {}
+    narrative = (intel.get("narrative") or STATE.get("narrative_classification")) or None
+    return {
+        "symbol": STATE.get("current_symbol"),
         "side": side,
-        "entry": round(entry, 4),
-        "qty": qty,
-        "pnl": round(pnl, 2),
-        "sl": round(STATE.get("synthetic_sl", 0), 4),
-        "tp1": round(STATE.get("synthetic_tp1", 0), 4),
-        "tp2": round(STATE.get("tp2_price", 0), 4),
+        "entry": round(entry, 6),
+        "current_price": mark,
+        "pnl": STATE.get("unrealized_pnl_usdt", 0.0),
+        "roe": STATE.get("roe_pct", 0.0),
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
         "tp1_done": STATE.get("tp1_hit", False),
         "trailing_active": STATE.get("trail_activated", False),
-        "regime": MEMORY.get("regime", "UNKNOWN"),
-        "trade_type": STATE.get("trade_type", "N/A"),
-        "entry_type": STATE.get("entry_type", "N/A"),
-        "classification": STATE.get("classification", "N/A"),
-        "location": STATE.get("location", "N/A"),
-        "zone": STATE.get("zone_info", "N/A"),
-        "score": STATE.get("trade_score", 0),
-        "narrative_classification": STATE.get("narrative_classification", ""),
+        "trail_stop": STATE.get("trail_stop", 0.0),
+        "location": STATE.get("location"),
+        "zone": STATE.get("zone_info"),
+        "zone_behaviour": STATE.get("zone_behaviour"),
+        "narrative": narrative,
         "narrative_confidence": STATE.get("narrative_confidence", 0.0),
-        "confidence_level": STATE.get("confidence_level", ""),
-        "current_confidence": STATE.get("current_confidence", 50.0),
-        "market_regime": STATE.get("market_regime", "UNKNOWN"),
-        "continuation_pressure": STATE.get("continuation_pressure", 50),
-        "trade_state": STATE.get("trade_state", "RANGE_CHOP"),
+        "confidence": STATE.get("current_confidence", None),
+        "confidence_level": STATE.get("confidence_level"),
+        "regime": STATE.get("market_regime"),
+        "market_session": STATE.get("market_session"),
+        "session_label": STATE.get("session_label"),
+        "trade_state": STATE.get("trade_state"),
+        "board": _board_or_empty(),
+        "state": _lifecycle_name(),
         "trail_multiplier": STATE.get("smart_trail_mult", 1.5),
-        "delay_tp1": STATE.get("delay_tp1", False)
+        "delay_tp1": STATE.get("delay_tp1", False),
+        "trade_type": STATE.get("trade_type"),
+        "entry_type": STATE.get("entry_type"),
+        "classification": STATE.get("classification"),
+        "score": STATE.get("trade_score", 0),
+        "current_confidence": STATE.get("current_confidence", 50.0),
+        "continuation_pressure": STATE.get("continuation_pressure", 50),
+        "market_phase": STATE.get("market_phase"),
+        "entry_timing": STATE.get("entry_timing"),
+        "narrative_classification": STATE.get("narrative_classification"),
+        "qty": STATE.get("qty", 0.0),
+        "remaining_qty": STATE.get("remaining_qty", 0.0),
+        "entry_atr": STATE.get("entry_atr", 0.0),
+        "dynamic_tp1": STATE.get("dynamic_tp1", 0.0),
+        "dynamic_tp2": STATE.get("dynamic_tp2", 0.0),
+        "last_update_ts": STATE.get("last_update_ts") or STATE.get("entry_time"),
     }
+
+
+def _refresh_live_levels(entry, side, atr, symbol, classification=None):
+    """P1 single TP/SL authority: run once per management tick so the persisted
+    level fields are mutually consistent and geometrically valid. The strategy
+    formulas (synthetic SL, ATR TP floor, TP2 continuation) remain the decision
+    makers; this function only finalizes persistence and enforces the invariant
+    (breakeven SL == entry after TP1 is banked is preserved)."""
+    entry = float(entry or 0.0)
+    side = str(side).upper()
+    atr = float(atr or 0.0)
+    if entry <= 0:
+        return
+    min_dist = max(atr * 0.5, entry * 0.002)
+    sl = float(STATE.get("synthetic_sl", 0.0) or 0.0)
+    tp1 = float(STATE.get("dynamic_tp1", 0.0) or 0.0)
+    if tp1 <= 0:
+        tp1 = float(STATE.get("synthetic_tp1", 0.0) or 0.0)
+    if tp1 <= 0:
+        tp1 = float(STATE.get("tp1_price", 0.0) or 0.0)
+    tp2 = float(STATE.get("tp2_price", 0.0) or 0.0)
+    if tp2 <= 0:
+        tp2 = float(STATE.get("synthetic_tp2", 0.0) or 0.0)
+    if sl <= 0:
+        sl = entry - (atr * 1.6 if side == "BUY" else -atr * 1.6)
+    if STATE.get("tp1_hit"):
+        if side == "BUY":
+            sl = max(sl, entry)
+            if tp2 > 0:
+                tp2 = max(tp2, entry + min_dist)
+        else:
+            sl = min(sl, entry)
+            if tp2 > 0:
+                tp2 = min(tp2, entry - min_dist)
+    else:
+        sl, tp1, tp2 = _enforce_sl_tp_geometry(side, entry, sl, tp1, tp2, atr, symbol=symbol)
+    STATE["synthetic_tp1"] = tp1
+    STATE["synthetic_tp2"] = tp2
+    STATE["tp1_price"] = tp1
+    STATE["tp2_price"] = tp2
+    STATE["dynamic_tp1"] = tp1
+    STATE["dynamic_tp2"] = tp2
+    STATE["synthetic_sl"] = sl
+
+
+def publish_position_state(symbol, side, entry, qty, pnl=0.0):
+    DASHBOARD_STATE["position"] = _build_canonical_position_payload()
 
 def update_position_dashboard(symbol, side, entry, qty, pnl=0.0):
     publish_position_state(symbol, side, entry, qty, pnl)
@@ -6329,36 +6477,55 @@ def finalize_trade_with_reality(symbol):
         mark_price = get_ticker_safe(symbol)
     pnl_usdt = 0.0
     pnl_pct = 0.0
+    booked_usdt = sum(float(l.get("pnl_usdt", 0.0) or 0.0) for l in STATE.get("partial_realized", []))
+    booked_pct = sum(float(l.get("pnl_pct", 0.0) or 0.0) for l in STATE.get("partial_realized", []))
+    final_usdt = 0.0
+    final_pct = 0.0
     if PAPER_MODE:
         entry = STATE["entry"]
         side = STATE["side"]
         mark_price = mark_price if mark_price is not None else STATE.get("mark_price", entry)
+        remaining_qty = float(STATE.get("remaining_qty", 0.0) or 0.0)
+        qty_init = float(STATE.get("qty_initial", 0.0) or STATE.get("qty", 0.0) or 0.0)
         if side == "BUY":
-            pnl_pct = (mark_price - entry) / entry * 100
+            final_pct = (mark_price - entry) / entry * 100
         else:
-            pnl_pct = (entry - mark_price) / entry * 100
-        pnl_usdt = pnl_pct / 100 * entry * STATE["qty"]
-        if paper.get("committed_margin", 0) >= STATE["margin"]:
-            paper["balance"] = paper.get("balance", 10000.0) + STATE["margin"] + pnl_usdt
-            paper["committed_margin"] = paper.get("committed_margin", 0.0) - STATE["margin"]
-            log_execution(f"[PAPER MARGIN] released {STATE['margin']:.2f} USDT + PnL {pnl_usdt:+.2f} -> free={paper['balance']:.2f}, total_committed={paper['committed_margin']:.2f}", "INFO")
+            final_pct = (entry - mark_price) / entry * 100
+        final_usdt = final_pct / 100 * entry * remaining_qty
+        released = STATE["margin"] * (remaining_qty / qty_init) if qty_init > 0 and STATE["margin"] else 0.0
+        if paper.get("committed_margin", 0) >= released:
+            paper["balance"] = paper.get("balance", 10000.0) + released + final_usdt
+            paper["committed_margin"] = paper.get("committed_margin", 0.0) - released
+            log_execution(f"[PAPER MARGIN] released {released:.2f} USDT + final PnL {final_usdt:+.2f} -> free={paper['balance']:.2f}, total_committed={paper['committed_margin']:.2f}", "INFO")
         else:
-            paper["balance"] = paper.get("balance", 10000.0) + pnl_usdt
-            log_execution(f"[PAPER MARGIN] WARN: restoring {STATE['margin']:.2f} exceeded committed {paper.get('committed_margin',0):.2f}; only PnL added", "WARN")
+            paper["balance"] = paper.get("balance", 10000.0) + final_usdt
+            log_execution(f"[PAPER MARGIN] WARN: restoring {released:.2f} exceeded committed {paper.get('committed_margin',0):.2f}; only final PnL added", "WARN")
+        pnl_pct = booked_pct + final_pct
+        pnl_usdt = booked_usdt + final_usdt
     else:
         realized_usdt, realized_pct = get_realized_pnl_for_symbol(symbol, lookback_seconds=30)
         if realized_usdt != 0.0:
-            pnl_usdt = realized_usdt
-            pnl_pct = realized_pct
+            final_usdt = realized_usdt - booked_usdt
+            final_pct = realized_pct - booked_pct
         else:
             if roe is not None:
-                pnl_pct = roe
+                remaining_qty = float(STATE.get("remaining_qty", 0.0) or 0.0)
+                qty_init = float(STATE.get("qty_initial", 0.0) or STATE.get("qty", 0.0) or 0.0)
+                share = (remaining_qty / qty_init) if qty_init > 0 else 1.0
+                final_pct = roe * share
                 if STATE.get("margin", 0) > 0:
-                    pnl_usdt = STATE["margin"] * (roe / 100)
+                    final_usdt = STATE["margin"] * (final_pct / 100)
                 else:
-                    pnl_usdt = (pnl_pct / 100) * STATE["entry"] * STATE["qty"]
-    PERF["total_pnl_pct"] += pnl_pct
-    PERF["total_pnl_usdt"] += pnl_usdt
+                    final_usdt = (final_pct / 100) * STATE["entry"] * remaining_qty
+            else:
+                entry = STATE.get("entry", 0.0) or 0.0
+                side = STATE.get("side")
+                m = mark_price or STATE.get("mark_price") or entry
+                final_pct = ((m - entry) / entry * 100) if side == "BUY" else ((entry - m) / entry * 100)
+                final_usdt = final_pct / 100 * entry * float(STATE.get("remaining_qty", 0.0) or 0.0)
+        pnl_pct = booked_pct + final_pct
+        pnl_usdt = booked_usdt + final_usdt
+    _credit_realized_pnl(final_pct, final_usdt, symbol)
     PERF["trades"] += 1
     if pnl_pct >= 0:
         PERF["wins"] += 1
@@ -6366,7 +6533,7 @@ def finalize_trade_with_reality(symbol):
     else:
         PERF["losses"] += 1
         result = "LOSS"
-    PERF["last_trade"] = {"result": result, "pnl_pct": pnl_pct}
+    PERF["last_trade"] = {"result": result, "pnl_pct": pnl_pct, "pnl_usdt": pnl_usdt}
     TRADE_STATE.update({
         "in_position": False,
         "symbol": None,
@@ -6382,7 +6549,7 @@ def finalize_trade_with_reality(symbol):
     })
     DASHBOARD_STATE["live_trade_mode"] = False
     log_execution(f"Trade closed: {result} {pnl_pct:.2f}% | USDT: {pnl_usdt:+.2f}", "SUCCESS" if pnl_pct>=0 else "ERROR")
-    entry_time = STATE.get("entry_time", time.time())
+    entry_time = STATE.get("entry_time") or STATE.get("last_update_ts") or time.time()
     tg_close(STATE.get("current_symbol") or "UNKNOWN", pnl_pct,
              max(0.0, (time.time() - entry_time)) / 60.0, STATE.get("side"))
     with _TRADE_LOCK:
@@ -6409,6 +6576,9 @@ def finalize_trade_with_reality(symbol):
         STATE["zone_behaviour"] = "NEUTRAL"
         STATE["trade_board"] = {}
         STATE["trade_intelligence"] = {}
+        STATE["partial_realized"] = []
+        STATE["fill_request_price"] = None
+        STATE["qty_initial"] = 0.0
         STATE["dynamic_reversal_exit_done"] = False
         STATE["dynamic_exhaustion_protect_done"] = False
         STATE["dynamic_partial_done"] = False
@@ -7021,6 +7191,225 @@ def apply_atr_tp_floor(side, price, tp1, tp2, atr, asset_class="CRYPTO"):
     return min(float(tp1), float(price) - tp1_pts), min(float(tp2), float(price) - tp2_pts)
 
 
+# ========== P0 FILL RECONCILIATION + ACCOUNTING (single authority) ==========
+def _enforce_sl_tp_geometry(side, entry, sl, tp1, tp2, atr, symbol=None):
+    """Guarantee the directional geometry invariant: BUY SL < ENTRY < TP1 < TP2,
+    SELL SL > ENTRY > TP1 > TP2. Only ever WIDENS/corrects; never tightens a
+    legitimately-placed target. This is the last line of defence against stale
+    admission-price levels surviving past the authoritative fill."""
+    entry = float(entry)
+    min_dist = max(float(atr or 0.0) * 0.5, entry * 0.002)
+    if str(side).upper() == "BUY":
+        if float(sl) >= entry - min_dist:
+            sl = entry - min_dist
+        if float(tp1) <= entry + min_dist:
+            tp1 = entry + min_dist
+        if float(tp2) <= float(tp1) + min_dist:
+            tp2 = float(tp1) + min_dist
+    else:
+        if float(sl) <= entry + min_dist:
+            sl = entry + min_dist
+        if float(tp1) >= entry - min_dist:
+            tp1 = entry - min_dist
+        if float(tp2) >= float(tp1) - min_dist:
+            tp2 = float(tp1) - min_dist
+    if symbol:
+        try:
+            sl = PrecisionSafety.normalize_price(symbol, sl)
+            tp1 = PrecisionSafety.normalize_price(symbol, tp1)
+            tp2 = PrecisionSafety.normalize_price(symbol, tp2)
+        except Exception:
+            pass
+    return sl, tp1, tp2
+
+
+def _guard_target_distance(side, entry, target, atr):
+    """Keep a single take-profit target outside the safety epsilon of entry."""
+    entry = float(entry)
+    min_dist = max(float(atr or 0.0) * 0.5, entry * 0.002)
+    if str(side).upper() == "BUY":
+        return max(float(target), entry + min_dist)
+    return min(float(target), entry - min_dist)
+
+
+def _reconcile_levels_after_fill(actual_entry, symbol, side, trade_type, classification,
+                                 atr=None, force_validate=False):
+    """P0 fill reconciliation: re-derive SL/TP from the authoritative fill entry.
+
+    Divergence branch (live): actual fill != admission price -> recompute levels
+    from the actual entry using the existing strategy formulas, apply the ATR TP
+    floor and the directional geometry guard, never persist a corrupt target.
+    Force-validate branch (paper / post-sync hardening): levels already stand;
+    only correct a broken geometry, never rewrite good targets.
+    Returns True if any persisted level was corrected."""
+    try:
+        side = str(side).upper()
+        actual_entry = float(actual_entry)
+        tsym = symbol or STATE.get("current_symbol") or DEFAULT_SYMBOL
+        atr = float(atr) if atr else 0.0
+        if atr <= 0:
+            atr = float(STATE.get("entry_atr") or 0.0)
+        df = None
+        df_ok = False
+        try:
+            df = get_ohlcv_safe(tsym, 100)
+            df_ok = df is not None and isinstance(df, pd.DataFrame) and len(df) >= 15
+        except Exception:
+            df_ok = False
+        if df_ok:
+            try:
+                _atr_series = compute_atr(df)
+                if _atr_series is not None and len(_atr_series) and float(_atr_series.iloc[-1]) > 0:
+                    atr = float(_atr_series.iloc[-1])
+            except Exception:
+                pass
+        if atr <= 0:
+            atr = max(0.0, actual_entry) * 0.002
+
+        admission = STATE.get("fill_request_price")
+        diverged = False
+        if admission is None:
+            diverged = True
+        else:
+            try:
+                diverged = abs(float(actual_entry) - float(admission)) > max(1e-12, float(admission) * 1e-6)
+            except Exception:
+                diverged = True
+        if not diverged and not force_validate:
+            return False
+
+        old = {"sl": float(STATE.get("sl", 0.0) or 0.0),
+               "tp1": float(STATE.get("tp1_price", 0.0) or 0.0),
+               "tp2": float(STATE.get("tp2_price", 0.0) or 0.0),
+               "d1": float(STATE.get("dynamic_tp1", 0.0) or 0.0),
+               "d2": float(STATE.get("dynamic_tp2", 0.0) or 0.0)}
+        cls = classification or STATE.get("classification") or "REVERSAL"
+        changed = False
+
+        if diverged:
+            sl = old["sl"]
+            tp1 = old["tp1"]
+            tp2 = old["tp2"]
+            if tp1 <= 0 or tp2 <= 0:
+                try:
+                    sl, tp1, tp2 = compute_sl_tp(actual_entry, side, cls, atr, df if df_ok else None)
+                except Exception:
+                    sl, tp1, tp2 = compute_sl_tp(actual_entry, side, cls, atr, None)
+            else:
+                try:
+                    sl, tp1, tp2 = compute_sl_tp(actual_entry, side, cls, atr, df if df_ok else None)
+                except Exception:
+                    sl, tp1, tp2 = compute_sl_tp(actual_entry, side, cls, atr, None)
+            try:
+                dyn_tp1, dyn_tp2 = apply_atr_tp_floor(
+                    side, actual_entry, tp1, tp2, atr,
+                    asset_class=AssetBehaviorProfile.resolve_asset_class(tsym))
+            except Exception:
+                dyn_tp1, dyn_tp2 = tp1, tp2
+            n_sl, n_tp1, n_tp2 = _enforce_sl_tp_geometry(side, actual_entry, sl, tp1, tp2, atr, symbol=tsym)
+        else:
+            n_sl = old["sl"]
+            n_tp1 = old["tp1"]
+            n_tp2 = old["tp2"]
+            dyn_tp1 = old["d1"]
+            dyn_tp2 = old["d2"]
+            if n_sl <= 0 and n_tp1 <= 0 and n_tp2 <= 0:
+                try:
+                    sl0, tp10, tp20 = compute_sl_tp(actual_entry, side, cls, atr, df if df_ok else None)
+                except Exception:
+                    sl0, tp10, tp20 = compute_sl_tp(actual_entry, side, cls, atr, None)
+                n_sl, n_tp1, n_tp2 = sl0, tp10, tp20
+                changed = True
+            n_sl, n_tp1, n_tp2 = _enforce_sl_tp_geometry(side, actual_entry, n_sl, n_tp1, n_tp2, atr, symbol=tsym)
+            if dyn_tp1 and dyn_tp1 > 0:
+                dyn_tp1 = _guard_target_distance(side, actual_entry, dyn_tp1, atr)
+            else:
+                dyn_tp1 = n_tp1
+            if dyn_tp2 and dyn_tp2 > 0:
+                dyn_tp2 = _guard_target_distance(side, actual_entry, dyn_tp2, atr)
+            else:
+                dyn_tp2 = n_tp2
+
+        fresh = {"sl": n_sl, "tp1": n_tp1, "tp2": n_tp2, "d1": dyn_tp1, "d2": dyn_tp2}
+        for k, v in old.items():
+            if abs(float(v) - float(fresh[k])) > 1e-12:
+                changed = True
+
+        STATE["entry"] = actual_entry
+        STATE["sl"] = n_sl
+        STATE["tp1_price"] = n_tp1
+        STATE["tp2_price"] = n_tp2
+        STATE["dynamic_tp1"] = dyn_tp1
+        STATE["dynamic_tp2"] = dyn_tp2
+        STATE["synthetic_sl"] = n_sl
+        STATE["synthetic_tp1"] = dyn_tp1
+        STATE["synthetic_tp2"] = dyn_tp2
+        STATE["entry_atr"] = atr
+
+        if diverged:
+            log_execution(
+                f"[FILL_RECONCILE] symbol={tsym} side={side} admission_entry={admission} "
+                f"actual_fill_entry={actual_entry} old_sl={old['sl']:.6f} old_tp1={old['tp1']:.6f} "
+                f"old_tp2={old['tp2']:.6f} new_sl={n_sl:.6f} new_tp1={n_tp1:.6f} new_tp2={n_tp2:.6f} "
+                f"correction_reason=fill_divergence", "WARN")
+        elif changed:
+            log_execution(
+                f"[FILL_RECONCILE] symbol={tsym} side={side} geometry/target correction applied: "
+                f"old sl={old['sl']:.6f}/tp1={old['tp1']:.6f}/tp2={old['tp2']:.6f} -> "
+                f"new sl={n_sl:.6f}/tp1={n_tp1:.6f}/tp2={n_tp2:.6f} "
+                f"correction_reason=geometry_guard", "INFO")
+        return changed or diverged
+    except Exception as e:
+        log_execution(f"[FILL_RECONCILE] error: {e}", "WARN")
+        return False
+
+
+def _credit_realized_pnl(pct, usdt, symbol=None):
+    """Book realized PnL immediately (partial legs + final leg) into PERF and
+    the per-symbol ledger. trades/wins/losses stay tagged only at finalize."""
+    pct = float(pct or 0.0)
+    usdt = float(usdt or 0.0)
+    PERF["total_pnl_pct"] += pct
+    PERF["total_pnl_usdt"] += usdt
+    if symbol:
+        ledger = PERF.setdefault("symbols", {}).setdefault(str(symbol), {})
+        ledger["realized_pct"] = ledger.get("realized_pct", 0.0) + pct
+        ledger["realized_usdt"] = ledger.get("realized_usdt", 0.0) + usdt
+        ledger["trades"] = ledger.get("trades", 0) + 1
+        ledger["last_update_ts"] = time.time()
+
+
+def _record_partial_leg(side, qty, price, entry, pnl_pct, pnl_usdt, mode="PAPER"):
+    """Record one realized partial-close leg so finalize never double counts it."""
+    leg = {"side": side, "qty": float(qty), "price": float(price),
+           "entry": float(entry), "pnl_pct": float(pnl_pct or 0.0),
+           "pnl_usdt": float(pnl_usdt or 0.0), "ts": time.time(), "mode": mode}
+    STATE.setdefault("partial_realized", []).append(leg)
+    _credit_realized_pnl(pnl_pct, pnl_usdt, STATE.get("current_symbol") or STATE.get("symbol"))
+
+
+def _live_entry_context(symbol, fallback_price, fallback_atr):
+    """F3: the queue/institutional execution path must derive SL/TP from LIVE
+    price+ATR at execution time, not from the promotion-time snapshot."""
+    price = fallback_price
+    atr = fallback_atr
+    try:
+        tick = get_ticker_safe(symbol)
+        if tick:
+            price = float(tick)
+    except Exception:
+        pass
+    try:
+        df = get_ohlcv_safe(symbol, 100)
+        if df is not None and isinstance(df, pd.DataFrame) and len(df) >= 15:
+            _s = compute_atr(df)
+            if _s is not None and len(_s) and float(_s.iloc[-1]) > 0:
+                atr = float(_s.iloc[-1])
+    except Exception:
+        pass
+    return price, atr
+
+
 def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification):
     """Final execution gate. Strategy intelligence decides *whether* the setup
     is institutionally mature; this function remains the sole order-entry
@@ -7338,7 +7727,11 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "tp1_hold_score": 10,
             "exit_warning": 0,
             "runner_mode": False,
-            "entry_atr": atr_local
+            "entry_atr": atr_local,
+            "fill_request_price": price,
+            "qty_initial": qty,
+            "partial_realized": [],
+            "position_asset_class": AssetBehaviorProfile.resolve_asset_class(symbol)
         })
         TRADE_STATE.update({
             "in_position": True, "symbol": symbol, "side": side, "entry": price, "qty": qty,
@@ -7361,6 +7754,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         else:
             paper["balance"] = 0.0
             log_execution(f"[PAPER MARGIN] WARN: free balance {free_bal:.2f} below required margin {margin:.2f} — committed what was available", "WARN")
+        _reconcile_levels_after_fill(price, symbol, side, trade_type, classification, atr_local, force_validate=True)
         update_position_dashboard(symbol, side, price, qty)
         log_execution(f"PAPER {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
         tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
@@ -7412,7 +7806,11 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "tp1_hold_score": 10,
             "exit_warning": 0,
             "runner_mode": False,
-            "entry_atr": atr_local
+            "entry_atr": atr_local,
+            "fill_request_price": price,
+            "qty_initial": qty,
+            "partial_realized": [],
+            "position_asset_class": AssetBehaviorProfile.resolve_asset_class(symbol)
         })
         TRADE_STATE.update({
             "in_position": True, "symbol": symbol, "side": side, "entry": price, "qty": qty,
@@ -7437,6 +7835,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         log_execution(f"[EXECUTION] {symbol} {side} executed at {price:.4f}", "SUCCESS")
         time.sleep(1)
         sync_position_state(symbol)
+        _reconcile_levels_after_fill(STATE.get("entry", price), symbol, side, trade_type,
+                                     classification, atr_local, force_validate=True)
         return True
     else:
         return False
@@ -10814,27 +11214,6 @@ class WatchlistRotation:
         return True
     def get_next_batch(self):
         return self.universe[:5]
-
-def process_queue_entry():
-    if not USE_EXECUTION_QUEUE:
-        return
-    if STATE.get("open") or TRADE_STATE.get("in_position"):
-        return
-    best = queue.get_best_candidate()
-    if best is None:
-        return
-    if best.state != ExecutionState.READY:
-        return
-    price = best.price
-    atr = best.atr
-    sl, tp1, tp2 = compute_sl_tp(price, best.side, "REVERSAL", atr, None)
-    log_execution(f"[QUEUE] Executing best candidate {best.symbol} {best.side} (score={best.priority_score})", "INFO")
-    # Thread the Atom classification (TREND / REVERSAL / SNIPER_REVERSAL) through
-    # to position management so the open trade is managed by its real thesis
-    # type instead of the generic "QUEUE" label (which always normalized to TREND).
-    manage_type = getattr(best, "trade_type", None) or "TREND"
-    execute_entry(best.side, best.symbol, price, sl, tp1, tp2, best.priority_score, best.original_reason,
-                  atr, manage_type, "EXECUTION_QUEUE", classification="INSTITUTIONAL_SNIPER")
 
 def _analyze_next_watchlist_candidate():
     global _watchlist_analysis_pointer, _watchlist_analysis_stats
@@ -14485,10 +14864,9 @@ def process_queue_entry():
         return
     if best.state != ExecutionState.READY:
         return
-    price = best.price
-    atr = best.atr
+    price, atr = _live_entry_context(best.symbol, best.price, best.atr)
     sl, tp1, tp2 = compute_sl_tp(price, best.side, "REVERSAL", atr, None)
-    log_execution(f"[QUEUE] Executing best candidate {best.symbol} {best.side} (score={best.priority_score})", "INFO")
+    log_execution(f"[QUEUE] Executing best candidate {best.symbol} {best.side} (score={best.priority_score} live_price={price})", "INFO")
     # Thread the Atom classification (TREND / REVERSAL / SNIPER_REVERSAL) through
     # to position management so the open trade is managed by its real thesis
     # type instead of the generic "QUEUE" label (which always normalized to TREND).
