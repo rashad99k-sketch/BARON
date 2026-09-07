@@ -144,7 +144,8 @@ class AccountingLifecycleTest(unittest.TestCase):
         self.assertEqual(e.PERF["trades"], 1)
         self.assertEqual(e.PERF["wins"], 1)
         self.assertAlmostEqual(e.PERF["total_pnl_usdt"], 350.0)
-        self.assertAlmostEqual(e.PERF["total_pnl_pct"], 11.0)
+        # size-weighted return: 350 USDT / (100 entry * 100 qty_initial) * 100
+        self.assertAlmostEqual(e.PERF["total_pnl_pct"], 3.5)
         self.assertEqual(len(e.STATE["partial_realized"]), 0)  # reset on close
 
     def test_multi_symbol_ledger(self):

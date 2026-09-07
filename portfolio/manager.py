@@ -2,6 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional, Any, List
+import contextlib
 import copy
 import os
 import threading
@@ -48,6 +49,23 @@ class PortfolioManager:
             self._base_state = copy.deepcopy(engine.STATE)
         if self._base_trade_state is None:
             self._base_trade_state = copy.deepcopy(engine.TRADE_STATE)
+
+    def _trade_lock(self):
+        """E-01: the engine-wide RLock is the single cross-thread authority for
+        STATE/TRADE_STATE/contexts (Flask routes, event-bus worker, manager
+        loop). Falls back to the manager-local RLock when unbound."""
+        eng = self.engine
+        if eng is not None and hasattr(eng, "_TRADE_LOCK"):
+            return eng._TRADE_LOCK
+        return self._lock
+
+    @contextlib.contextmanager
+    def _locks(self):
+        """Engine-wide lock OUTER, manager-local lock INNER (stable order: no
+        ABBA). RLock makes every nesting level safe for re-entry."""
+        with self._trade_lock():
+            with self._lock:
+                yield
 
     def count(self) -> int:
         return len(self.contexts)
@@ -98,7 +116,7 @@ class PortfolioManager:
         return stored if stored else self._asset_class(pos.symbol)
 
     def can_open(self, symbol: str, asset_class: str | None = None) -> bool:
-        with self._lock:
+        with self._locks():
             if symbol in self.contexts or len(self.contexts) >= self.max_positions:
                 return False
             if not self.risk_guard.can_open(symbol, len(self.contexts)):
@@ -136,7 +154,7 @@ class PortfolioManager:
     def activate(self, symbol: Optional[str]):
         if not self.engine:
             raise RuntimeError("PortfolioManager is not bound to core.engine")
-        with self._lock:
+        with self._locks():
             self._capture()
             self.active_symbol = symbol
             if symbol is None:
@@ -150,19 +168,23 @@ class PortfolioManager:
                     self.engine._exchange_sync,
                     self.engine._recovery_guard,
                 )
+                if hasattr(ctx_manager, "symbol"):
+                    ctx_manager.symbol = symbol
                 self.engine._live_manager = ctx_manager
                 return
             self.engine.STATE.clear()
             self.engine.STATE.update(copy.deepcopy(ctx.state))
             self.engine.TRADE_STATE.clear()
             self.engine.TRADE_STATE.update(copy.deepcopy(ctx.trade_state))
+            if hasattr(ctx.live_manager, "symbol"):
+                ctx.live_manager.symbol = symbol
             self.engine._live_manager = ctx.live_manager
             paper = getattr(self.engine, "paper", None)
             if isinstance(paper, dict):
                 paper["position"] = copy.deepcopy(ctx.paper_position)
 
     def deactivate(self):
-        with self._lock:
+        with self._locks():
             self._capture()
             self.active_symbol = None
             self._blank()
@@ -170,6 +192,8 @@ class PortfolioManager:
     def _store_after_open(self, symbol: str, manager, asset_class: Optional[str] = None):
         if asset_class is None:
             asset_class = self._asset_class(symbol)
+        if manager is not None and hasattr(manager, "symbol"):
+            manager.symbol = symbol
         self.contexts[symbol] = PositionContext(
             symbol=symbol,
             state=copy.deepcopy(self.engine.STATE),
@@ -183,6 +207,10 @@ class PortfolioManager:
         )
 
     def open_candidate(self, candidate: dict) -> bool:
+        with self._trade_lock():
+            return self._open_candidate_locked(candidate)
+
+    def _open_candidate_locked(self, candidate: dict) -> bool:
         symbol = candidate["symbol"]
         if not self.can_open(symbol, candidate.get("asset_class")):
             return False
@@ -262,44 +290,53 @@ class PortfolioManager:
         if not self.engine:
             return
         for symbol in list(self.contexts.keys()):
-            self.activate(symbol)
             try:
-                if not self.engine.STATE.get("open"):
-                    self.contexts.pop(symbol, None)
-                    continue
-                self.engine.sync_position_state(symbol)
-                if self.engine.STATE.get("open"):
-                    self.engine._live_manager.manage_live_trade()
-                if self.engine.STATE.get("open"):
-                    price = self.engine.get_ticker_safe(symbol)
-                    if price:
-                        df = self.engine.get_ohlcv_safe(symbol, 50)
-                        if df is not None:
-                            try:
-                                if self.engine.council_exit(df, price):
-                                    # council_exit may already have closed AND
-                                    # finalized via close_position_full(); only
-                                    # finalize again if the position is STILL
-                                    # open, otherwise the same runner's PnL is
-                                    # realized twice (double-counted loss/win).
-                                    if self.engine.STATE.get("open"):
-                                        self.engine.finalize_trade_with_reality(symbol)
-                            except Exception as exc:
-                                self.engine.log_execution(
-                                    f"[PORTFOLIO] council_exit {symbol}: {exc}", "WARN"
-                                )
-                if not self.engine.STATE.get("open"):
-                    self.contexts.pop(symbol, None)
-                else:
-                    self._capture()
+                self._manage_one(symbol)
             except Exception as exc:
                 self.engine.log_execution(f"[PORTFOLIO] manage {symbol}: {exc}", "ERROR")
             finally:
                 self.risk_guard.sync_closed_trades()
                 self.engine.MEMORY["portfolio_risk"] = self.risk_guard.snapshot(self.count())
-                self.deactivate()
+
+    def _manage_one(self, symbol):
+        self.activate(symbol)
+        try:
+            if not self.engine.STATE.get("open"):
+                self.contexts.pop(symbol, None)
+                return
+            self.engine.sync_position_state(symbol)
+            if self.engine.STATE.get("open"):
+                self.engine._live_manager.manage_live_trade()
+            if self.engine.STATE.get("open"):
+                price = self.engine.get_ticker_safe(symbol)
+                if price:
+                    df = self.engine.get_ohlcv_safe(symbol, 50)
+                    if df is not None:
+                        try:
+                            # E-03: council_exit is advisory only
+                            # (close_inline=False). The single close gate is
+                            # close_position_full, which finalizes internally.
+                            if self.engine.council_exit(df, price, close_inline=False):
+                                if self.engine.STATE.get("open"):
+                                    self.engine.close_position_full()
+                        except Exception as exc:
+                            self.engine.log_execution(
+                                f"[PORTFOLIO] council_exit {symbol}: {exc}", "WARN"
+                            )
+            if not self.engine.STATE.get("open"):
+                self.contexts.pop(symbol, None)
+            else:
+                self._capture()
+        finally:
+            self.deactivate()
 
     def restore_from_exchange(self):
+        if not self.engine:
+            return
+        with self._trade_lock():
+            self._restore_from_exchange_locked()
+
+    def _restore_from_exchange_locked(self):
         if not self.engine:
             return
         try:
@@ -349,6 +386,8 @@ class PortfolioManager:
                     self.engine._exchange_sync,
                     self.engine._recovery_guard
                 )
+                if hasattr(self.engine._live_manager, "symbol"):
+                    self.engine._live_manager.symbol = symbol
                 self.engine._live_manager.set_entry_atr(atr)
                 self._store_after_open(symbol, self.engine._live_manager)
                 # ---- Trade Management Safety: journaled, idempotent recovery ----
@@ -412,6 +451,10 @@ class PortfolioManager:
     def close_symbol(self, symbol: str) -> bool:
         if symbol not in self.contexts:
             return False
+        with self._trade_lock():
+            return self._close_symbol_locked(symbol)
+
+    def _close_symbol_locked(self, symbol: str) -> bool:
         self.activate(symbol)
         try:
             if self.engine.STATE.get("open"):

@@ -1914,7 +1914,11 @@ class ExchangeSyncService:
                     reason="exchange confirmed no open position for symbol", state=local_state,
                     level="WARN",
                 )
-                self.event_bus.emit("force_close_local", {"symbol": symbol})
+                self.event_bus.emit("force_close_local", {
+                    "symbol": symbol,
+                    "trade_id": local_state.get("trade_id"),
+                    "ts": time.time(),
+                })
             return
         with _TRADE_LOCK:
             STATE["entry"] = snap.entry_price
@@ -3799,6 +3803,9 @@ class LiveTradeManager:
         self.recovery = recovery_guard
         self.lifecycle_state = TradeLifecycleState.IDLE
         self.current_snapshot = None
+        # E-02: every manager is bound to ONE symbol. Async bus events are
+        # applied only when they concern the symbol this manager owns.
+        self.symbol = None
         self.last_management_ts = 0
         self.last_log_ts = 0
         self.last_live_debug_ts = 0
@@ -3821,11 +3828,19 @@ class LiveTradeManager:
         event_bus.subscribe("lifecycle_change", self._set_lifecycle)
 
     def _set_lifecycle(self, state):
+        # NOTE (E-02, reverted): async bus events carry no target manager and
+        # arrive on the CURRENTLY seated manager only, so a symbol-vs-current
+        # guard here suppressed the OPEN_PENDING->LIVE promotion chain and made
+        # portfolio management order-sensitive. Symbol binding for lifecycle is
+        # enforced at _apply_management (per seated symbol) instead.
         self.lifecycle_state = state
         log_execution(f"[LIFECYCLE] New state: {state.value}", "INFO")
         DASHBOARD_STATE["lifecycle_state"] = state.value
 
     def _on_reconciled(self, snapshot):
+        # NOTE (E-02, reverted): same rationale as _set_lifecycle -- the worker
+        # delivers snapshots to the currently seated manager, so guarding on the
+        # seated symbol here suppressed the RECOVERING->LIVE promotion path.
         self.current_snapshot = snapshot
         DASHBOARD_STATE["live_trade_mode"] = True
         if self.lifecycle_state == TradeLifecycleState.RECOVERING:
@@ -3845,6 +3860,16 @@ class LiveTradeManager:
                 "WARN", debounce_key=f"force_close_mismatch_{target_symbol}", debounce_sec=30,
             )
             return
+        # E-02/E-01: this handler runs on the async bus worker; bind it to this
+        # manager's OWN symbol as well and serialize it with the manager loop.
+        # Freshness: a force-close emitted for an OLDER trade on the same symbol
+        # (queued across a close/reopen boundary) must never kill the NEW trade.
+        ev_trade = data.get("trade_id") if isinstance(data, dict) else None
+        cur_trade = STATE.get("trade_id")
+        if ev_trade and cur_trade and ev_trade != cur_trade:
+            return
+        # Bus-worker handler: process synchronously (never defer into a later
+        # window; the manager-side operations hold the trade lock themselves).
         if STATE["open"]:
             STATE["close_reason"] = "EXTERNAL_CLOSE"
             close_position_full()
@@ -4728,7 +4753,16 @@ class LiveTradeManager:
             DASHBOARD_STATE["live_trade_mode"] = False
             return
 
-        if not STATE.get("tp1_hit", False):
+        # ---- TP1 is a PRICE GATE: the partial may only bank when the live mark
+        # is at/through the far-side ladder target. The old hold-score-only hinge
+        # let TP1 bank before price arrival and then stranded the runner off the
+        # true far target (the classic XPL/WLD inverted-ladder failure).
+        tp1_target = float(STATE.get("synthetic_tp1", 0.0) or 0.0)
+        if tp1_target <= 0:
+            tp1_target = float(STATE.get("tp1_price", 0.0) or 0.0)
+        tp1_reached = (side == "BUY" and mark_price >= tp1_target) or \
+                      (side == "SELL" and mark_price <= tp1_target)
+        if not STATE.get("tp1_hit", False) and tp1_reached:
             _journal_trade_event(
                 _tj.TP1_ELIGIBLE, symbol=symbol, side=side,
                 reason=f"TP1 profit target arrived (hold_score={tp1_hold_score})",
@@ -4786,33 +4820,47 @@ class LiveTradeManager:
                                                         base_trail_mult, trade_state)
             STATE["smart_trail_mult"] = adjusted_mult
 
-            tp2_pct = 0.05
-            if continuation_eval.continuation_probability > 0.8:
-                tp2_pct = 0.08
-            # G1: ATR-aware TP2 — asset profile tp2_atr scales (never tightens)
-            # the hard-coded percent target with the real volatility at entry.
-            _tp2_cfg = AssetBehaviorProfile.get(STATE.get("position_asset_class") or "CRYPTO")
-            tp2_roe_target = float(_tp2_cfg.get("tp2_atr", 4.0)) * (atr / entry) * 100.0
-            if tp2_roe_target > 0:
-                tp2_pct = max(tp2_pct, min(0.15, tp2_roe_target))
-            tp2_price = entry * (1 + tp2_pct) if side == "BUY" else entry * (1 - tp2_pct)
-            STATE["tp2_price"] = tp2_price
-            if not STATE.get("tp2_hit", False):
-                if (side == "BUY" and mark_price >= tp2_price) or (side == "SELL" and mark_price <= tp2_price):
-                    log_execution(f"[SYNTHETIC_TP2] Hit at {mark_price:.4f}", "SUCCESS")
-                    STATE["close_reason"] = "TAKE_PROFIT_TP2"
-                    STATE["tp2_state"] = "EXECUTED"
-                    STATE["tp2_event_ts"] = time.time()
-                    _journal_trade_event(
-                        _tj.TP2_EXECUTED, symbol=symbol, side=side,
-                        reason=f"TP2 target reached {mark_price:.4f} (roe={roe:.2f}%)", state=STATE,
-                        level="SUCCESS",
-                    )
-                    close_position_full()
-                    STATE["tp2_hit"] = True
-                    self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
-                    DASHBOARD_STATE["live_trade_mode"] = False
-                    return
+        # ---- TP2 runner ladder: evaluated EVERY tick, independent of tp1_hit.
+        # The far target is the persisted synthetic_tp2 (ATR-scaled at fill) and
+        # is always pushed beyond TP1, so a strong move can finish the whole
+        # position at TP2 even if the TP1 partial was never banked.
+        tp2_pct = 0.05
+        if continuation_eval.continuation_probability > 0.8:
+            tp2_pct = 0.08
+        # G1: ATR-aware TP2 — asset profile tp2_atr scales (never tightens)
+        # the hard-coded percent target with the real volatility at entry.
+        _tp2_cfg = AssetBehaviorProfile.get(STATE.get("position_asset_class") or "CRYPTO")
+        tp2_roe_target = float(_tp2_cfg.get("tp2_atr", 4.0)) * (atr / entry) * 100.0
+        if tp2_roe_target > 0:
+            tp2_pct = max(tp2_pct, min(0.15, tp2_roe_target))
+        tp2_price_ref = entry * (1 + tp2_pct) if side == "BUY" else entry * (1 - tp2_pct)
+        tp2_price = float(STATE.get("synthetic_tp2", 0.0) or 0.0)
+        if tp2_price <= 0:
+            tp2_price = tp2_price_ref
+        tp1_ladder = float(STATE.get("synthetic_tp1", 0.0) or STATE.get("tp1_price", 0.0) or 0.0)
+        ladder_min_dist = max(atr * 0.5, entry * 0.002)
+        if side == "BUY":
+            tp2_price = max(tp2_price, tp2_price_ref, tp1_ladder + ladder_min_dist)
+        else:
+            tp2_price = min(tp2_price, tp2_price_ref, tp1_ladder - ladder_min_dist)
+        STATE["tp2_price"] = tp2_price
+        STATE["synthetic_tp2"] = tp2_price
+        if not STATE.get("tp2_hit", False):
+            if (side == "BUY" and mark_price >= tp2_price) or (side == "SELL" and mark_price <= tp2_price):
+                log_execution(f"[SYNTHETIC_TP2] Hit at {mark_price:.4f}", "SUCCESS")
+                STATE["close_reason"] = "TAKE_PROFIT_TP2"
+                STATE["tp2_state"] = "EXECUTED"
+                STATE["tp2_event_ts"] = time.time()
+                _journal_trade_event(
+                    _tj.TP2_EXECUTED, symbol=symbol, side=side,
+                    reason=f"TP2 target reached {mark_price:.4f} (roe={roe:.2f}%)", state=STATE,
+                    level="SUCCESS",
+                )
+                close_position_full()
+                STATE["tp2_hit"] = True
+                self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
+                DASHBOARD_STATE["live_trade_mode"] = False
+                return
 
         trail_mult = STATE.get("smart_trail_mult", 1.5)
         if smart_money.get("distribution_risk", 0) > 45:
@@ -4972,7 +5020,14 @@ def sync_position_state(symbol=None):
     snap = _exchange_sync.fetch_live_snapshot(symbol)
     if snap is None:
         if STATE.get("open"):
-            log_execution(f"[POS_SYNC] Position closed externally on {symbol}, cleaning state", "WARN")
+            log_execution(f"[POS_SYNC] Position closed externally on {symbol}, capturing realized PnL", "WARN")
+            # E-05: an external close in LIVE must book the realized leg through
+            # the very same finalize path (get_realized_pnl_for_symbol), never
+            # silently wipe state and lose the PnL.
+            try:
+                finalize_trade_with_reality(symbol)
+            except Exception as exc:
+                log_execution(f"[POS_SYNC] external-close finalize error: {exc}", "ERROR")
             with _TRADE_LOCK:
                 STATE["open"] = False
                 TRADE_STATE["in_position"] = False
@@ -6297,10 +6352,14 @@ def _refresh_live_levels(entry, side, atr, symbol, classification=None):
             sl = max(sl, entry)
             if tp2 > 0:
                 tp2 = max(tp2, entry + min_dist)
+            if tp1 > 0 and tp2 < tp1 + min_dist:
+                tp2 = tp1 + min_dist
         else:
             sl = min(sl, entry)
             if tp2 > 0:
                 tp2 = min(tp2, entry - min_dist)
+            if tp1 > 0 and tp2 > tp1 - min_dist:
+                tp2 = tp1 - min_dist
     else:
         sl, tp1, tp2 = _enforce_sl_tp_geometry(side, entry, sl, tp1, tp2, atr, symbol=symbol)
     STATE["synthetic_tp1"] = tp1
@@ -7217,10 +7276,15 @@ def finalize_trade_with_reality(symbol):
                 final_usdt = final_pct / 100 * entry * float(STATE.get("remaining_qty", 0.0) or 0.0)
         pnl_pct = booked_pct + final_pct
         pnl_usdt = booked_usdt + final_usdt
-    _credit_realized_pnl(final_pct, final_usdt, symbol)
+    _fin_notional = float(STATE.get("entry", 0.0) or 0.0) * float(STATE.get("qty_initial", 0.0) or STATE.get("qty", 0.0) or 0.0)
+    if _fin_notional > 0:
+        final_wgt_pct = float(final_usdt or 0.0) / _fin_notional * 100.0
+    else:
+        final_wgt_pct = float(final_pct or 0.0)
+    _credit_realized_pnl(final_wgt_pct, final_usdt, symbol, count_trade=True)
     # ---- P0/P1: final-leg realized accretion + classified TRADE_CLOSED ----
     STATE["realized_pnl_usdt"] = float(STATE.get("realized_pnl_usdt", 0.0) or 0.0) + float(final_usdt or 0.0)
-    STATE["realized_pnl_pct"] = float(STATE.get("realized_pnl_pct", 0.0) or 0.0) + float(final_pct or 0.0)
+    STATE["realized_pnl_pct"] = float(STATE.get("realized_pnl_pct", 0.0) or 0.0) + final_wgt_pct
     _margin_f = float(STATE.get("margin", 0.0) or 0.0)
     if _margin_f > 0:
         STATE["realized_roe_pct"] = STATE["realized_pnl_usdt"] / _margin_f * 100
@@ -8090,6 +8154,35 @@ def _reconcile_levels_after_fill(actual_entry, symbol, side, trade_type, classif
             else:
                 dyn_tp2 = n_tp2
 
+        # ---- TP ladder unification: a single authoritative ladder. TP2 always
+        # sits on the FAR side of TP1 for the trade direction (never closer).
+        # Every persisted field mirrors the same ordered values so display,
+        # journal and management never disagree (fixes the inverted-ladder bug).
+        _lad_min = max(float(atr or 0.0) * 0.5, actual_entry * 0.002)
+        if str(side).upper() == "BUY":
+            if dyn_tp1 and dyn_tp1 > 0:
+                dyn_tp1 = max(dyn_tp1, actual_entry + _lad_min)
+            else:
+                dyn_tp1 = n_tp1
+            if dyn_tp2 and dyn_tp2 > 0:
+                dyn_tp2 = max(dyn_tp2, dyn_tp1 + _lad_min)
+            else:
+                dyn_tp2 = n_tp2
+            if dyn_tp2 < dyn_tp1 + _lad_min:
+                dyn_tp2 = dyn_tp1 + _lad_min
+        else:
+            if dyn_tp1 and dyn_tp1 > 0:
+                dyn_tp1 = min(dyn_tp1, actual_entry - _lad_min)
+            else:
+                dyn_tp1 = n_tp1
+            if dyn_tp2 and dyn_tp2 > 0:
+                dyn_tp2 = min(dyn_tp2, dyn_tp1 - _lad_min)
+            else:
+                dyn_tp2 = n_tp2
+            if dyn_tp2 > dyn_tp1 - _lad_min:
+                dyn_tp2 = dyn_tp1 - _lad_min
+        n_tp1, n_tp2 = dyn_tp1, dyn_tp2
+
         fresh = {"sl": n_sl, "tp1": n_tp1, "tp2": n_tp2, "d1": dyn_tp1, "d2": dyn_tp2}
         for k, v in old.items():
             if abs(float(v) - float(fresh[k])) > 1e-12:
@@ -8128,9 +8221,10 @@ def _reconcile_levels_after_fill(actual_entry, symbol, side, trade_type, classif
         return False
 
 
-def _credit_realized_pnl(pct, usdt, symbol=None):
+def _credit_realized_pnl(pct, usdt, symbol=None, count_trade=False):
     """Book realized PnL immediately (partial legs + final leg) into PERF and
-    the per-symbol ledger. trades/wins/losses stay tagged only at finalize."""
+    the per-symbol ledger. pct is SIZE-WEIGHTED (pnl_usdt / opening notional).
+    A trade is counted ONCE at the final leg/finalize (count_trade=True)."""
     pct = float(pct or 0.0)
     usdt = float(usdt or 0.0)
     PERF["total_pnl_pct"] += pct
@@ -8139,7 +8233,8 @@ def _credit_realized_pnl(pct, usdt, symbol=None):
         ledger = PERF.setdefault("symbols", {}).setdefault(str(symbol), {})
         ledger["realized_pct"] = ledger.get("realized_pct", 0.0) + pct
         ledger["realized_usdt"] = ledger.get("realized_usdt", 0.0) + usdt
-        ledger["trades"] = ledger.get("trades", 0) + 1
+        if count_trade:
+            ledger["trades"] = ledger.get("trades", 0) + 1
         ledger["last_update_ts"] = time.time()
 
 
@@ -8149,10 +8244,16 @@ def _record_partial_leg(side, qty, price, entry, pnl_pct, pnl_usdt, mode="PAPER"
            "entry": float(entry), "pnl_pct": float(pnl_pct or 0.0),
            "pnl_usdt": float(pnl_usdt or 0.0), "ts": time.time(), "mode": mode}
     STATE.setdefault("partial_realized", []).append(leg)
-    _credit_realized_pnl(pnl_pct, pnl_usdt, STATE.get("current_symbol") or STATE.get("symbol"))
+    _leg_notional = float(entry) * float(STATE.get("qty_initial", 0.0) or STATE.get("qty", 0.0) or 0.0)
+    if _leg_notional > 0:
+        leg_wgt_pct = float(pnl_usdt or 0.0) / _leg_notional * 100.0
+    else:
+        leg_wgt_pct = float(pnl_pct or 0.0)
+    # pct is SIZE-WEIGHTED so a 50% partial at +4% books 2%, not 4%.
+    _credit_realized_pnl(leg_wgt_pct, pnl_usdt, STATE.get("current_symbol") or STATE.get("symbol"))
     # ---- P0/P1 realized PnL accretion (single source for payload/journal) ----
     STATE["realized_pnl_usdt"] = float(STATE.get("realized_pnl_usdt", 0.0) or 0.0) + float(pnl_usdt or 0.0)
-    STATE["realized_pnl_pct"] = float(STATE.get("realized_pnl_pct", 0.0) or 0.0) + float(pnl_pct or 0.0)
+    STATE["realized_pnl_pct"] = float(STATE.get("realized_pnl_pct", 0.0) or 0.0) + leg_wgt_pct
     _margin = float(STATE.get("margin", 0.0) or 0.0)
     if _margin > 0:
         STATE["realized_roe_pct"] = STATE["realized_pnl_usdt"] / _margin * 100
@@ -10063,22 +10164,28 @@ def scaling_logic(symbol, df, ind):
                 return True
     return False
 
-def council_exit(df, price):
+def council_exit(df, price, close_inline=True):
+    """E-03: advisory exit tribunal. Only ADVISES; ownership of the actual close
+    stays with close_position_full (the single close gate). When close_inline is
+    True (legacy single-position loop) it closes inline for backwards parity."""
     adx_series = compute_adx(df)
     adx = adx_series.iloc[-1] if adx_series is not None else 0
     if adx < 18:
         log_execution(f"Exit: ADX dropped to {adx:.1f}", "WARN")
-        close_position_full()
+        if close_inline:
+            close_position_full()
         return True
     if STATE["side"] == "BUY" and price < STATE.get("synthetic_sl", 0):
         log_execution(f"Stop loss hit at {price:.4f}", "WARN")
         tg_sl_hit(STATE["current_symbol"], (price - STATE["entry"])/STATE["entry"]*100 if STATE["side"]=="BUY" else (STATE["entry"]-price)/STATE["entry"]*100)
-        close_position_full()
+        if close_inline:
+            close_position_full()
         return True
     elif STATE["side"] == "SELL" and price > STATE.get("synthetic_sl", 0):
         log_execution(f"Stop loss hit at {price:.4f}", "WARN")
         tg_sl_hit(STATE["current_symbol"], (STATE["entry"]-price)/STATE["entry"]*100)
-        close_position_full()
+        if close_inline:
+            close_position_full()
         return True
     return False
 

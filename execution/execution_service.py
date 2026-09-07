@@ -23,6 +23,19 @@ class ExecutionService:
         ))
 
     def close(self, symbol=None):
+        # E-07: symbol-bound close. The request must name the currently seated
+        # symbol; a mismatched symbol must never close a different position.
         if symbol:
+            active = self.core.STATE.get("current_symbol")
+            if active and str(symbol) != str(active):
+                self.core.log_execution(
+                    f"[EXEC] close({symbol}) ignored: active={active} (symbol-bound)",
+                    "WARN",
+                )
+                return False
+            if not self.core.STATE.get("open"):
+                return False
             return self.core.close_position_full()
-        return self.core.close_position_full()
+        if self.core.STATE.get("open"):
+            return self.core.close_position_full()
+        return False
