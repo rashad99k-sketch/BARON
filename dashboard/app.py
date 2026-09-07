@@ -10,6 +10,11 @@ import hmac
 from flask import Flask, jsonify, request
 import core.engine as E
 import scanner.scanner as S
+
+try:
+    from portfolio.manager import canonical_position_payload as _canonical_pos_payload
+except Exception:
+    _canonical_pos_payload = None
 globals().update({k:v for k,v in vars(E).items() if not k.startswith('__')})
 globals().update({k:v for k,v in vars(S).items() if not k.startswith('__')})
 
@@ -662,12 +667,19 @@ function updateUI(d) {{
         : "No active positions";
 
     if(d.position) {{
-        let pnlClass = d.position.pnl >= 0 ? "green" : "red";
+        const pnlUsdt = Number(d.position.pnl || d.position.pnl_usdt || 0);
+        const roeV = Number(d.position.roe != null ? d.position.roe : (d.position.roe_pct || 0));
+        let pnlClass = pnlUsdt >= 0 ? "green" : "red";
+        const rlzUsdt = Number(d.position.realized_pnl_usdt || 0);
+        const rlzCls = rlzUsdt >= 0 ? "green" : "red";
+        const stage = d.position.profit_stage || "OPENED";
+        const prot = d.position.protection_state || "NONE";
         document.getElementById("pos").innerHTML = `
             <div><b>${{d.position.symbol}}</b> | ${{d.position.side}} | ${{d.position.entry_type}} (${{d.position.classification}})</div>
-            <div>Entry: ${{d.position.entry}} | PnL: <span class="${{pnlClass}}">${{d.position.pnl}}%</span></div>
+            <div>Entry: ${{d.position.entry}} | Unrealized PnL: <span class="${{pnlClass}}">${{pnlUsdt.toFixed(2)}} USDT</span> (ROE <span class="${{pnlClass}}">${{roeV.toFixed(2)}}%</span>)</div>
             <div>SL: ${{d.position.sl}} | TP1: ${{d.position.tp1}} | TP2: ${{d.position.tp2}}</div>
-            <div>TP1 done: ${{d.position.tp1_done}} | Trailing: ${{d.position.trailing_active}}</div>
+            <div>TP1: ${{d.position.tp1_done ? "done" : "pending"}} | Stage: <b>${{stage}}</b> | Protection: <b>${{prot}}</b></div>
+            <div>Realized: <span class="${{rlzCls}}">${{rlzUsdt.toFixed(2)}} USDT (${{Number(d.position.realized_pnl_pct || 0).toFixed(2)}}%)</span> | Legs: ${{d.position.realized_legs || 0}} | TradeId: ${{d.position.trade_id || "-"}}</div>
             <div>Location: ${{d.position.location}} | Zone: ${{d.position.zone}}</div>
             <div>Narrative: ${{d.position.narrative_classification}} (Conf: ${{d.position.narrative_confidence}}) | Conf Level: ${{d.position.confidence_level}}</div>
             <div>Current Confidence: ${{d.position.current_confidence}} | Regime: ${{d.position.market_regime}} | Cont. Pressure: ${{d.position.continuation_pressure}}</div>
@@ -1026,35 +1038,52 @@ def data():
         perf = get_dashboard_metrics()
         pos = DASHBOARD_STATE.get("position")
         if STATE["open"] and STATE.get("current_symbol") and pos is None:
-            roe = STATE.get("roe_pct", 0.0)
-            pos = {
-                "symbol": STATE["current_symbol"],
-                "side": STATE["side"],
-                "entry": round(STATE["entry"],4),
-                "qty": STATE["qty"],
-                "pnl": round(roe, 2),
-                "sl": round(STATE.get("synthetic_sl",0),4),
-                "tp1": round(STATE.get("synthetic_tp1",0),4),
-                "tp2": round(STATE.get("tp2_price",0),4),
-                "tp1_done": STATE.get("tp1_hit", False),
-                "trailing_active": STATE.get("trail_activated", False),
-                "regime": MEMORY.get("regime", "UNKNOWN"),
-                "trade_type": STATE.get("trade_type"),
-                "entry_type": STATE.get("entry_type"),
-                "classification": STATE.get("classification"),
-                "location": STATE.get("location"),
-                "zone": STATE.get("zone_info"),
-                "score": STATE.get("trade_score", 0),
-                "narrative_classification": STATE.get("narrative_classification"),
-                "narrative_confidence": STATE.get("narrative_confidence", 0.0),
-                "confidence_level": STATE.get("confidence_level"),
-                "current_confidence": STATE.get("current_confidence", 50.0),
-                "market_regime": STATE.get("market_regime", "UNKNOWN"),
-                "continuation_pressure": STATE.get("continuation_pressure", 50),
-                "trade_state": STATE.get("trade_state", "RANGE_CHOP"),
-                "trail_multiplier": STATE.get("smart_trail_mult", 1.5),
-                "delay_tp1": STATE.get("delay_tp1", False)
-            }
+            # P1-4: build the position through the canonical payload so realized
+            # vs unrealized stay separate and every documented key is present.
+            try:
+                if _canonical_pos_payload is not None:
+                    pos = _canonical_pos_payload(STATE["current_symbol"], STATE)
+            except Exception:
+                pos = None
+            if pos is None:
+                # Last-resort legacy projection (pnl is USDT, roe is the %).
+                roe = STATE.get("roe_pct", 0.0)
+                pos = {
+                    "symbol": STATE["current_symbol"],
+                    "side": STATE["side"],
+                    "entry": round(STATE["entry"],4),
+                    "qty": STATE["qty"],
+                    "pnl": round(STATE.get("unrealized_pnl_usdt", 0.0), 2),
+                    "roe": round(roe, 2),
+                    "roe_pct": round(roe, 2),
+                    "realized_pnl_usdt": round(STATE.get("realized_pnl_usdt", 0.0), 2),
+                    "realized_pnl_pct": round(STATE.get("realized_pnl_pct", 0.0), 2),
+                    "realized_legs": int(STATE.get("realized_legs", 0) or 0),
+                    "profit_stage": STATE.get("profit_stage"),
+                    "protection_state": STATE.get("protection_state"),
+                    "trade_id": STATE.get("trade_id"),
+                    "sl": round(STATE.get("synthetic_sl",0),4),
+                    "tp1": round(STATE.get("synthetic_tp1",0),4),
+                    "tp2": round(STATE.get("tp2_price",0),4),
+                    "tp1_done": STATE.get("tp1_hit", False),
+                    "trailing_active": STATE.get("trail_activated", False),
+                    "regime": MEMORY.get("regime", "UNKNOWN"),
+                    "trade_type": STATE.get("trade_type"),
+                    "entry_type": STATE.get("entry_type"),
+                    "classification": STATE.get("classification"),
+                    "location": STATE.get("location"),
+                    "zone": STATE.get("zone_info"),
+                    "score": STATE.get("trade_score", 0),
+                    "narrative_classification": STATE.get("narrative_classification"),
+                    "narrative_confidence": STATE.get("narrative_confidence", 0.0),
+                    "confidence_level": STATE.get("confidence_level"),
+                    "current_confidence": STATE.get("current_confidence", 50.0),
+                    "market_regime": STATE.get("market_regime", "UNKNOWN"),
+                    "continuation_pressure": STATE.get("continuation_pressure", 50),
+                    "trade_state": STATE.get("trade_state", "RANGE_CHOP"),
+                    "trail_multiplier": STATE.get("smart_trail_mult", 1.5),
+                    "delay_tp1": STATE.get("delay_tp1", False)
+                }
         health = MEMORY["health"].copy()
         health["errors"] = len(DASHBOARD_STATE["errors"])
         top5 = MEMORY.get("top_candidates", [])[:5] if "top_candidates" in MEMORY else []
@@ -1104,7 +1133,14 @@ def data():
                 "reclaim_risk": STATE.get("reclaim_risk", 0),
                 "trade_state": STATE.get("trade_state", "RANGE_CHOP"),
                 "trail_multiplier": STATE.get("smart_trail_mult", 1.5),
-                "delay_tp1": STATE.get("delay_tp1", False)
+                "delay_tp1": STATE.get("delay_tp1", False),
+                "trade_id": STATE.get("trade_id"),
+                "profit_stage": STATE.get("profit_stage"),
+                "protection_state": STATE.get("protection_state"),
+                "position_status": STATE.get("position_status"),
+                "realized_pnl_usdt": STATE.get("realized_pnl_usdt", 0),
+                "realized_pnl_pct": STATE.get("realized_pnl_pct", 0),
+                "realized_legs": int(STATE.get("realized_legs", 0) or 0)
             }
             live_data["live_trade_mode"] = True
             live_data["supervisor"] = supervisor_data
@@ -1209,6 +1245,20 @@ def data():
             "total_pnl": perf["total_pnl"],
             "total_pnl_usdt": perf["total_pnl_usdt"],
             "last_trade": perf["last_trade"],
+            # P1-4 profit summary: realized (banked) vs unrealized (floating)
+            # are reported independently, never blended.
+            "profit_summary": {
+                "realized_pnl_usdt": round(float(STATE.get("realized_pnl_usdt", 0.0) or 0.0), 2),
+                "realized_pnl_pct": round(float(STATE.get("realized_pnl_pct", 0.0) or 0.0), 2),
+                "realized_roe_pct": round(float(STATE.get("realized_roe_pct", 0.0) or 0.0), 2),
+                "realized_legs": int(STATE.get("realized_legs", 0) or 0),
+                "unrealized_pnl_usdt": round(float(STATE.get("unrealized_pnl_usdt", 0.0) or 0.0), 2),
+                "unrealized_roe_pct": round(float(STATE.get("roe_pct", 0.0) or 0.0), 2),
+                "profit_stage": STATE.get("profit_stage"),
+                "protection_state": STATE.get("protection_state"),
+                "last_trade": STATE.get("last_trade_summary")
+                            if isinstance(STATE.get("last_trade_summary"), dict) else None,
+            },
             "scanner_v2_buy": MEMORY.get("scanner_v2_buy", []),
             "scanner_v2_sell": MEMORY.get("scanner_v2_sell", []),
             "watchlist": watchlist_data,

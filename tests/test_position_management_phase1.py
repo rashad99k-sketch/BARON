@@ -125,14 +125,19 @@ class PositionHealthScoreTest(unittest.TestCase):
 
 class AdvisoryIntegrationTest(unittest.TestCase):
     def setUp(self):
+        self._orig_ohlcv = E.get_ohlcv_safe
+        self._orig_obc = E.get_orderbook_cached
+        self._orig_tick = E.get_ticker_safe
         E.get_ohlcv_safe = lambda symbol, limit=120, htf=False: _df(250, trend=0.15)
         E.get_orderbook_cached = lambda *a, **k: {"bids": [[99.0, 10.0]], "asks": [[101.0, 5.0]]}
         E.get_ticker_safe = lambda symbol, retries=3: 105.0
-        self._saved_ohlcv = None
         self._manager = E.LiveTradeManager(E._event_bus, E._exchange_sync, E._recovery_guard)
         E.STATE["open"] = False
 
     def tearDown(self):
+        E.get_ohlcv_safe = self._orig_ohlcv
+        E.get_orderbook_cached = self._orig_obc
+        E.get_ticker_safe = self._orig_tick
         E.STATE["open"] = False
         E.STATE["position_profile"] = None
 
@@ -178,6 +183,7 @@ class AdvisoryIntegrationTest(unittest.TestCase):
         E.STATE["open"] = True
         E._closing_in_progress = False
         broker = E.close_position_full
+        partial_broker = E.close_partial
         E.close_position_full = lambda: False  # would be a bug if called
         E.close_partial = lambda ratio: False
         try:
@@ -198,6 +204,7 @@ class AdvisoryIntegrationTest(unittest.TestCase):
             self.assertIn(E.STATE["position_action"], ("PARTIAL", "EXIT", "PROTECT_PROFIT"))
         finally:
             E.close_position_full = broker
+            E.close_partial = partial_broker
             E.STATE["open"] = False
 
 

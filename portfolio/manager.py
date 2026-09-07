@@ -9,6 +9,11 @@ import time
 
 from portfolio.risk import PortfolioRiskGuard
 
+try:
+    from core import trade_journal as _tj
+except Exception:
+    _tj = None
+
 
 @dataclass
 class PositionContext:
@@ -272,7 +277,13 @@ class PortfolioManager:
                         if df is not None:
                             try:
                                 if self.engine.council_exit(df, price):
-                                    self.engine.finalize_trade_with_reality(symbol)
+                                    # council_exit may already have closed AND
+                                    # finalized via close_position_full(); only
+                                    # finalize again if the position is STILL
+                                    # open, otherwise the same runner's PnL is
+                                    # realized twice (double-counted loss/win).
+                                    if self.engine.STATE.get("open"):
+                                        self.engine.finalize_trade_with_reality(symbol)
                             except Exception as exc:
                                 self.engine.log_execution(
                                     f"[PORTFOLIO] council_exit {symbol}: {exc}", "WARN"
@@ -322,6 +333,14 @@ class PortfolioManager:
                     atr,
                     df
                 )
+                # P1-3: enforce directional TP geometry BEFORE persisting so a
+                # persisted stop/target never violates TP1 > entry > SL.
+                try:
+                    sl, tp1, tp2 = self.engine._enforce_sl_tp_geometry(
+                        self.engine.STATE["side"], self.engine.STATE["entry"],
+                        sl, tp1, tp2, atr, symbol=symbol)
+                except Exception:
+                    pass
                 self.engine.STATE["synthetic_sl"] = sl
                 self.engine.STATE["synthetic_tp1"] = tp1
                 self.engine.STATE["tp2_price"] = tp2
@@ -332,6 +351,54 @@ class PortfolioManager:
                 )
                 self.engine._live_manager.set_entry_atr(atr)
                 self._store_after_open(symbol, self.engine._live_manager)
+                # ---- Trade Management Safety: journaled, idempotent recovery ----
+                # Recover the pre-restart trade_id from the tamper-evident journal;
+                # never claim a partial banked without a journaled TP1 record. No
+                # realized PnL is fabricated here — the exchange simply reported an
+                # open position and the runner re-arms protective levels only.
+                _sid = str(self.engine.STATE.get("side", "BUY"))
+                _recovered_id = None
+                if _tj is not None:
+                    try:
+                        _recovered_id = _tj.recover_trade_id(symbol)
+                    except Exception:
+                        _recovered_id = None
+                if _recovered_id:
+                    self.engine.STATE["trade_id"] = _recovered_id
+                else:
+                    try:
+                        self.engine.STATE["trade_id"] = self.engine._generate_trade_id(symbol)
+                    except Exception:
+                        pass
+                self.engine.STATE["recovered"] = True
+                self.engine.STATE["recovery_ts"] = time.time()
+                self.engine.STATE["position_status"] = "RECOVERED"
+                self.engine.STATE["close_reason"] = None
+                try:
+                    self.engine._journal_trade_event(
+                        _tj.RESTART_RECOVERY, symbol=symbol, side=_sid,
+                        reason=f"restart discovered open {symbol} position on venue; "
+                               f"trade_id={'recovered' if _recovered_id else 'new'}",
+                        state=dict(self.engine.STATE), level="WARN",
+                        dedup_key=f"restart_recovery_{symbol}", dedup_sec=60,
+                    )
+                except Exception:
+                    pass
+                # Native protective stop is restored so a restart never leaves
+                # the runner unprotected (P0-3).
+                try:
+                    self.engine.place_native_sl(symbol)
+                except Exception:
+                    pass
+                try:
+                    self.engine._journal_trade_event(
+                        _tj.POSITION_RECOVERED, symbol=symbol, side=_sid,
+                        reason=f"position {symbol} reactivated; protective stop restored at {sl:.4f}",
+                        state=dict(self.engine.STATE), level="INFO",
+                        dedup_key=f"position_recovered_{symbol}", dedup_sec=60,
+                    )
+                except Exception:
+                    pass
                 self.engine.log_execution(f"[RECOVERY] Restored position for {symbol}", "INFO")
                 self.deactivate()
         except Exception as e:
@@ -441,4 +508,29 @@ def canonical_position_payload(symbol: str, s: dict, asset_class: Optional[str] 
         "dynamic_tp2": float(s.get("dynamic_tp2", 0.0) or 0.0),
         "entry_atr": float(s.get("entry_atr", 0.0) or 0.0),
         "last_update_ts": s.get("last_update_ts") or s.get("entry_time"),
+        # ---- P1-4 / hardening: realized vs unrealized NEVER mixed, plus the
+        # per-trade lifecycle identifiers surfaced on the canonical payload. ----
+        "trade_id": s.get("trade_id"),
+        "profit_stage": s.get("profit_stage"),
+        "protection_state": s.get("protection_state"),
+        "protection_floor_sl": float(s.get("protection_floor_sl", 0.0) or 0.0),
+        "realized_pnl_usdt": float(s.get("realized_pnl_usdt", 0.0) or 0.0),
+        "realized_pnl_pct": float(s.get("realized_pnl_pct", 0.0) or 0.0),
+        "realized_roe_pct": float(s.get("realized_roe_pct", 0.0) or 0.0),
+        "realized_legs": int(s.get("realized_legs", 0) or 0),
+        "tp1_state": s.get("tp1_state"),
+        "tp1_exec_price": float(s.get("tp1_exec_price", 0.0) or 0.0),
+        "tp1_event_ts": s.get("tp1_event_ts"),
+        "tp2_state": s.get("tp2_state"),
+        "tp2_event_ts": s.get("tp2_event_ts"),
+        "trail_activation_ts": s.get("trail_activation_ts"),
+        "native_sl_state": s.get("native_sl_state"),
+        "native_sl_price": float(s.get("native_sl_price", 0.0) or 0.0),
+        "position_status": s.get("position_status"),
+        "sync_status": s.get("sync_status"),
+        "recovered": bool(s.get("recovered", False)),
+        "exit_reason": s.get("exit_reason"),
+        "final_result_class": s.get("final_result_class"),
+        "last_trade_summary": (s.get("last_trade_summary")
+                               if isinstance(s.get("last_trade_summary"), dict) else None),
     }

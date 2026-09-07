@@ -251,6 +251,12 @@ class DynamicSixPositionRealEngineTest(_PortfolioEngineTestCase):
         # --- Rotation: freed slots are refilled by fresh candidates ---
         slots_freed = 6 - self.pm.count()
         self.assertGreater(slots_freed, 0)
+        # NOTE: the two verified SL exits realized consecutive losses, so the
+        # risk-guard correctly holds GLOBAL_LOSS_COOLDOWN (refusing new
+        # entries). Rotation CAPACITY is what this step tests, not the
+        # cooldown gate (which is covered by the runtime-validation suite), so
+        # clear the cooldown before refilling the freed slots.
+        self.pm.risk_guard._cooldown_until = 0.0
         rotated = self.pm.open_top(self.ROTATION, slots=slots_freed)
         self.assertEqual(rotated, slots_freed)
         self.assertEqual(self.pm.count(), 6)

@@ -479,6 +479,26 @@ def tg_close(symbol, pnl_pct, duration_min, side):
 def tg_error(err_msg, error_type="EXECUTION"):
     send_once(f"🚨 <b>ERROR</b> [{error_type}]\n{err_msg[:200]}", f"err_{error_type}_{err_msg[:50]}", 60)
 
+def tg_trade_event(event, symbol="", pnl_pct=None, reason="", extra=""):
+    """Part M: condensed lifecycle notifications; each event type is
+    rate-limited so journal storms cannot spam the chat."""
+    if TELEGRAM_BOT_TOKEN is None:
+        return
+    if pnl_pct is not None:
+        icon = "✅" if float(pnl_pct) >= 0 else "❌"
+    else:
+        icon = "🔔"
+    line = f"{icon} <b>{event}</b>"
+    if symbol:
+        line += f" {symbol}"
+    if pnl_pct is not None:
+        line += f" | PnL: {float(pnl_pct):+.2f}%"
+    if reason:
+        line += f"\n{reason[:120]}"
+    if extra:
+        line += f"\n{extra[:80]}"
+    send_once(line, f"tg_event_{event}_{symbol or 'GLOBAL'}", 25)
+
 # ========== CONFIGURATION ==========
 API_KEY = os.getenv("BINGX_API_KEY", "")
 API_SECRET = os.getenv("BINGX_API_SECRET", "")
@@ -1821,6 +1841,37 @@ class ExchangeSyncService:
             return snapshot
         except Exception as e:
             log_execution(f"[SYNC] REST snapshot error: {e}", "ERROR")
+            # P0-2: an API exception is NEVER evidence the position vanished.
+            # Preserve the last known snapshot / local state as a stale snapshot
+            # so callers keep protection intact instead of force-closing. Only a
+            # verdict-bearing exchange response (NOT_FOUND) closes locally.
+            if self._last_snapshot.symbol == symbol and self._last_snapshot.qty > 0:
+                self._last_snapshot.stale = True
+                self._last_snapshot.updated_at = time.time()
+                self._last_snapshot.source = "rest_sync_error"
+                STATE["sync_status"] = "ERROR"
+                STATE["position_status"] = "UNKNOWN"
+                _position_status_unknown(symbol, "api_exception")
+                return self._last_snapshot
+            if STATE.get("open") and STATE.get("current_symbol") == symbol:
+                stale = PositionSnapshot()
+                stale.symbol = symbol
+                stale.side = STATE.get("side", "BUY")
+                stale.qty = safe_float(STATE.get("remaining_qty", STATE.get("qty", 0)))
+                stale.entry_price = safe_float(STATE.get("entry", 0))
+                stale.mark_price = safe_float(STATE.get("mark_price", STATE.get("entry", 0)))
+                stale.unrealized_pnl = safe_float(STATE.get("unrealized_pnl_usdt", 0))
+                stale.margin = safe_float(STATE.get("margin", 0))
+                stale.leverage = safe_float(STATE.get("leverage", LEVERAGE))
+                stale.liquidation_price = safe_float(STATE.get("liquidation_price", 0))
+                stale.roe_pct = safe_float(STATE.get("roe_pct", 0))
+                stale.source = "local_stale_error"
+                stale.stale = True
+                stale.updated_at = time.time()
+                STATE["sync_status"] = "ERROR"
+                STATE["position_status"] = "UNKNOWN"
+                _position_status_unknown(symbol, "api_exception")
+                return stale if stale.qty > 0 else None
             return None
 
     def _paper_snapshot(self, symbol):
@@ -1830,10 +1881,13 @@ class ExchangeSyncService:
         snap.symbol = symbol
         snap.side = STATE["side"]
         snap.qty = STATE["qty"]
+        # Open quantity (NOT the original size): a banked partial must not make
+        # the open unrealized exposure larger than the runner that remains.
+        open_qty = float(STATE.get("remaining_qty", 0.0) or 0.0) or float(STATE.get("qty", 0.0) or 0.0)
         snap.entry_price = STATE["entry"]
         snap.mark_price = get_ticker_safe(symbol) or snap.entry_price
-        snap.unrealized_pnl = (snap.mark_price - snap.entry_price) * snap.qty if snap.side == "BUY" else (snap.entry_price - snap.mark_price) * snap.qty
-        snap.margin = snap.entry_price * snap.qty / LEVERAGE
+        snap.unrealized_pnl = (snap.mark_price - snap.entry_price) * open_qty if snap.side == "BUY" else (snap.entry_price - snap.mark_price) * open_qty
+        snap.margin = snap.entry_price * open_qty / LEVERAGE
         snap.roe_pct = (snap.unrealized_pnl / snap.margin) * 100 if snap.margin else 0
         snap.updated_at = time.time()
         snap.source = "paper"
@@ -1852,13 +1906,25 @@ class ExchangeSyncService:
                 log_execution(f"[RECONCILIATION] {symbol} venue-paused; keeping local position state intact", "WARN", debounce_key=f"reconcile_paused_{symbol}", debounce_sec=60)
                 return
             if local_state.get("open"):
+                # Confirmed absence (the exchange answered; no position). This is
+                # the ONLY condition that closes a local position.
                 log_execution(f"[RECONCILIATION] Position vanished, marking closed", "WARN")
-                self.event_bus.emit("force_close_local")
+                _journal_trade_event(
+                    _tj.EXTERNAL_CLOSE, symbol=symbol, side=local_state.get("side", ""),
+                    reason="exchange confirmed no open position for symbol", state=local_state,
+                    level="WARN",
+                )
+                self.event_bus.emit("force_close_local", {"symbol": symbol})
             return
         with _TRADE_LOCK:
             STATE["entry"] = snap.entry_price
             STATE["qty"] = snap.qty
-            STATE["remaining_qty"] = snap.qty
+            # Paper-mode authority: partial closes bank local remaining_qty and a
+            # reconciliation must NEVER grow the open size back after a TP1.
+            if not PAPER_MODE:
+                STATE["remaining_qty"] = snap.qty
+            elif snap.source != "paper":
+                STATE["remaining_qty"] = snap.qty
             STATE["side"] = snap.side
             STATE["mark_price"] = snap.mark_price
             STATE["unrealized_pnl_usdt"] = snap.unrealized_pnl
@@ -3419,12 +3485,13 @@ def close_partial(ratio):
     global _closing_in_progress, _reconciliation_pending
     if _closing_in_progress:
         log_execution("[CLOSE_PARTIAL] Already closing, skipping", "WARN")
-        return
+        return False
     if _reconciliation_pending:
         log_execution("[CLOSE_PARTIAL] Reconciliation pending, skipping", "WARN")
-        return
+        return False
     _closing_in_progress = True
     _reconciliation_pending = True
+    _ok = False
     try:
         if PAPER_MODE:
             if paper["position"]:
@@ -3438,19 +3505,25 @@ def close_partial(ratio):
                 pnl_usdt_leg = pnl_pct_leg / 100 * entry * closed_qty
                 STATE["remaining_qty"] = max(0.0, STATE["remaining_qty"] - closed_qty)
                 paper["position"]["remaining_qty"] = STATE["remaining_qty"]
+                # The PAPER venue ledger must track the LIVE post-close size, not
+                # the original open size. Leaving "qty" at the original amount
+                # makes fetch_all_open_positions() over-report contracts after a
+                # restart (partially-closed runner "grows back" and double exits).
+                paper["position"]["qty"] = STATE["remaining_qty"]
                 TRADE_STATE["qty"] = STATE["remaining_qty"]
                 _record_partial_leg(side_u, closed_qty, mark, entry, pnl_pct_leg, pnl_usdt_leg, "PAPER")
                 released = STATE["margin"] * (closed_qty / qty_init) if qty_init > 0 else 0.0
                 paper["balance"] = paper.get("balance", 10000.0) + pnl_usdt_leg + released
                 paper["committed_margin"] = max(0.0, paper.get("committed_margin", 0.0) - released)
                 log_execution(f"[CLOSE_PARTIAL] Paper partial close {ratio*100:.0f}% | leg PnL {pnl_pct_leg:+.2f}%/{pnl_usdt_leg:+.2f} USDT | margin released {released:.2f}", "SUCCESS")
-            return
+                _ok = True
+            return _ok
 
         symbol = STATE["current_symbol"]
         qty_to_close = STATE["remaining_qty"] * ratio
         if qty_to_close <= 0:
             log_execution("[CLOSE_PARTIAL] No quantity to close", "WARN")
-            return
+            return False
 
         side = "sell" if STATE["side"] == "BUY" else "buy"
         sym = normalize_symbol(symbol)
@@ -3458,11 +3531,11 @@ def close_partial(ratio):
         order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"reduceOnly": True, "positionSide": _hedge_position_side(STATE["side"])})
         if order is None:
             log_execution("[CLOSE_PARTIAL] Order creation failed (None)", "ERROR")
-            return
+            return False
         order_id = order.get('id')
         if not order_id:
             log_execution("[CLOSE_PARTIAL] No order ID returned", "ERROR")
-            return
+            return False
 
         filled, filled_qty = verify_order_filled(symbol, order_id, side, qty_precise, timeout=10)
         if filled:
@@ -3506,6 +3579,7 @@ def close_partial(ratio):
                     DASHBOARD_STATE["live_trade_mode"] = False
                     finalize_trade_with_reality(symbol)
             _exchange_sync.reconcile(symbol, STATE)
+            _ok = True
         else:
             log_execution(f"[CLOSE_PARTIAL] Partial close failed to fill after timeout", "ERROR")
             _exchange_sync.reconcile(symbol, STATE)
@@ -3514,6 +3588,7 @@ def close_partial(ratio):
     finally:
         _closing_in_progress = False
         _reconciliation_pending = False
+    return _ok
 
 # ========== FIXED: close_position_full with robust verification ==========
 def close_position_full():
@@ -3527,6 +3602,9 @@ def close_position_full():
     _closing_in_progress = True
     _reconciliation_pending = True
     try:
+        if not STATE["open"]:
+            log_execution("[CLOSE] No position to close", "WARN")
+            return False
         if PAPER_MODE:
             symbol = STATE.get("current_symbol") or DEFAULT_SYMBOL
             paper["position"] = None
@@ -3753,8 +3831,22 @@ class LiveTradeManager:
         if self.lifecycle_state == TradeLifecycleState.RECOVERING:
             self.lifecycle_state = TradeLifecycleState.LIVE
 
-    def _force_close(self, _):
+    def _force_close(self, data):
+        target_symbol = None
+        if isinstance(data, dict):
+            target_symbol = data.get("symbol")
+        active = STATE.get("current_symbol")
+        # P1-2: events are symbol-bound. A force-close for a DIFFERENT symbol
+        # must never close the position that happens to be active in STATE.
+        if target_symbol is not None and active and target_symbol != active:
+            log_execution(
+                f"[FORCE_CLOSE] SKIPPED mismatched close event symbol={target_symbol} "
+                f"active={active} (symbol-bound enforcement)",
+                "WARN", debounce_key=f"force_close_mismatch_{target_symbol}", debounce_sec=30,
+            )
+            return
         if STATE["open"]:
+            STATE["close_reason"] = "EXTERNAL_CLOSE"
             close_position_full()
             self.lifecycle_state = TradeLifecycleState.CLOSED
             DASHBOARD_STATE["live_trade_mode"] = False
@@ -3762,6 +3854,42 @@ class LiveTradeManager:
     def start_trade(self, symbol, side, entry_price, qty, sl, tp1, tp2):
         self.trade_board = TradeManagementBoard() if TRADE_INTELLIGENCE_AVAILABLE else None
         STATE["trade_board"] = {}
+        # ---- Trade Management Safety Hardening: fresh per-open lifecycle ----
+        _ensure_trade_hardening_state()
+        STATE["trade_id"] = _generate_trade_id(symbol)
+        STATE["profit_stage"] = _tj.STAGE_OPENED
+        STATE["protection_state"] = "NONE"
+        STATE["protection_floor_sl"] = None
+        STATE["profit_locked_event_ts"] = None
+        STATE["profit_detected_ts"] = None
+        STATE["realized_pnl_usdt"] = 0.0
+        STATE["realized_pnl_pct"] = 0.0
+        STATE["realized_roe_pct"] = 0.0
+        STATE["realized_legs"] = 0
+        STATE["partial_realized"] = []
+        STATE["tp1_state"] = "NONE"
+        STATE["tp1_order_id"] = None
+        STATE["tp1_fill_qty"] = 0.0
+        STATE["tp1_exec_price"] = None
+        STATE["tp1_event_ts"] = None
+        STATE["tp2_state"] = "NONE"
+        STATE["tp2_event_ts"] = None
+        STATE["trail_activation_ts"] = None
+        STATE["native_sl_state"] = "NONE"
+        STATE["native_sl_order_id"] = None
+        STATE["native_sl_price"] = None
+        STATE["exit_reason"] = None
+        STATE["close_reason"] = None
+        STATE["final_result_class"] = None
+        STATE["duration_sec"] = None
+        STATE["position_status"] = "OPEN"
+        STATE["sync_status"] = "OK"
+        STATE["recovered"] = False
+        _journal_trade_event(
+            _tj.TRADE_OPENED, symbol=symbol, side=side,
+            reason=f"entry={entry_price} qty={qty} sl={sl} tp1={tp1} tp2={tp2}",
+            state=STATE, level="INFO",
+        )
         self.lifecycle_state = TradeLifecycleState.OPEN_PENDING_CONFIRMATION
         self.event_bus.emit("lifecycle_change", TradeLifecycleState.OPEN_PENDING_CONFIRMATION)
         log_execution(f"[LIFECYCLE] Trade open requested for {symbol} {side}", "INFO")
@@ -4306,6 +4434,8 @@ class LiveTradeManager:
         roe = STATE.get("roe_pct", 0.0)
 
         self._update_peak_profit(roe, mark_price)
+        _ensure_trade_hardening_state()
+        _on_profit_detected(symbol, roe)
 
         ob = None
 
@@ -4542,13 +4672,34 @@ class LiveTradeManager:
         if self.brain.should_aggressive_profit_lock() and not STATE.get("profit_lock_activated", False):
             log_execution(f"[PROFIT_LOCK] Aggressive profit lock triggered (state={trade_state})", "WARN")
             if not STATE.get("tp1_hit", False):
-                close_partial(0.5)
-                STATE["tp1_hit"] = True
-                STATE["runner_mode"] = True
-            STATE["profit_lock_activated"] = True
+                _advance_profit_stage(_tj.STAGE_TP1_ELIGIBLE, "aggressive_profit_lock")
+                _cap = close_partial(0.5)
+                if _cap:
+                    STATE["tp1_hit"] = True
+                    STATE["runner_mode"] = True
+                    STATE["tp1_state"] = "EXECUTED"
+                    STATE["tp1_event_ts"] = time.time()
+                    _journal_trade_event(
+                        _tj.TP1_EXECUTED, symbol=symbol, side=side,
+                        reason=f"aggressive profit-lock TP1 partial filled roe={roe:.2f}%",
+                        state=STATE, level="SUCCESS",
+                    )
+                else:
+                    _journal_trade_event(
+                        _tj.TP1_FAILED, symbol=symbol, side=side,
+                        reason="aggressive profit-lock TP1 partial did NOT fill; TP1_DONE not claimed",
+                        state=STATE, level="WARN",
+                        dedup_key=f"tp1_fail_{symbol}", dedup_sec=10,
+                    )
+            if STATE.get("tp1_hit", False):
+                _apply_protection_ratchet(symbol=symbol, mark_price=mark_price,
+                                          side=side, entry=entry, atr=atr)
+                _profit_lock_then_journal(symbol=symbol, side=side,
+                                          reason="aggressive profit lock ratchet landed")
 
         if self.brain.should_hard_exit():
             log_execution(f"[HARD_EXIT] Hard exit triggered (state={trade_state})", "ERROR")
+            STATE["close_reason"] = "HARD_EXIT"
             close_position_full()
             self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
             DASHBOARD_STATE["live_trade_mode"] = False
@@ -4578,6 +4729,13 @@ class LiveTradeManager:
             return
 
         if not STATE.get("tp1_hit", False):
+            _journal_trade_event(
+                _tj.TP1_ELIGIBLE, symbol=symbol, side=side,
+                reason=f"TP1 profit target arrived (hold_score={tp1_hold_score})",
+                state=STATE, level="INFO",
+                metadata={"hold_score": tp1_hold_score, "roe": round(roe, 3)},
+                dedup_key=f"tp1_eligible_{symbol}", dedup_sec=30,
+            )
             if tp1_hold_score >= 8:
                 log_execution(f"[TP1_DELAY] Hold score {tp1_hold_score} >= 8, delaying TP1", "INFO")
                 # G1: prefer the persisted ATR-dynamic TP1 target (set at entry by
@@ -4586,12 +4744,37 @@ class LiveTradeManager:
                 STATE["synthetic_tp1"] = tp1_price
             else:
                 log_execution(f"[TP1_EXECUTE] Hold score {tp1_hold_score} < 8, executing TP1 partial close", "SUCCESS")
-                close_partial(0.5)
-                STATE["tp1_hit"] = True
-                STATE["synthetic_sl"] = entry
-                tg_tp_hit(symbol, 1, roe)
-                STATE["runner_mode"] = True
-                STATE["trail_activated"] = True
+                _advance_profit_stage(_tj.STAGE_TP1_ELIGIBLE, "tp1_reached")
+                _ok = close_partial(0.5)
+                if _ok:
+                    STATE["tp1_hit"] = True
+                    STATE["synthetic_sl"] = entry
+                    STATE["tp1_state"] = "EXECUTED"
+                    STATE["tp1_event_ts"] = time.time()
+                    STATE["runner_mode"] = True
+                    STATE["trail_activated"] = True
+                    STATE["trail_activation_ts"] = time.time()
+                    _journal_trade_event(
+                        _tj.TP1_EXECUTED, symbol=symbol, side=side,
+                        reason=f"TP1 partial close FILLED at {roe:.2f}% ROE (hold_score={tp1_hold_score})",
+                        state=STATE, level="SUCCESS",
+                        metadata={"hold_score": tp1_hold_score, "roe": round(roe, 3)},
+                    )
+                    _apply_protection_ratchet(symbol=symbol, mark_price=mark_price,
+                                              side=side, entry=entry, atr=atr,
+                                              reason="tp1_banked_breakeven")
+                    _profit_lock_then_journal(symbol=symbol, side=side,
+                                              reason="TP1 banked and breakeven locked")
+                    tg_tp_hit(symbol, 1, roe)
+                else:
+                    # TP1_DONE is ONLY claimed after a verified fill.
+                    STATE["tp1_state"] = "FAILED"
+                    _journal_trade_event(
+                        _tj.TP1_FAILED, symbol=symbol, side=side,
+                        reason="TP1 partial close did NOT fill; TP1_DONE not claimed, breakeven NOT set",
+                        state=STATE, level="WARN",
+                        dedup_key=f"tp1_fail_{symbol}", dedup_sec=10,
+                    )
                 self._update_peak_profit(roe, mark_price)
 
         if STATE.get("tp1_hit", False):
@@ -4617,6 +4800,14 @@ class LiveTradeManager:
             if not STATE.get("tp2_hit", False):
                 if (side == "BUY" and mark_price >= tp2_price) or (side == "SELL" and mark_price <= tp2_price):
                     log_execution(f"[SYNTHETIC_TP2] Hit at {mark_price:.4f}", "SUCCESS")
+                    STATE["close_reason"] = "TAKE_PROFIT_TP2"
+                    STATE["tp2_state"] = "EXECUTED"
+                    STATE["tp2_event_ts"] = time.time()
+                    _journal_trade_event(
+                        _tj.TP2_EXECUTED, symbol=symbol, side=side,
+                        reason=f"TP2 target reached {mark_price:.4f} (roe={roe:.2f}%)", state=STATE,
+                        level="SUCCESS",
+                    )
                     close_position_full()
                     STATE["tp2_hit"] = True
                     self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
@@ -4663,7 +4854,15 @@ class LiveTradeManager:
             if not STATE.get("trail_activated", False):
                 STATE["trail_activated"] = True
                 STATE["trail_stop"] = synthetic_sl
+                STATE["trail_activation_ts"] = time.time()
                 log_execution(f"[TRAIL] Activated (roe={roe:.2f}% >= {trail_activate_roe:.2f}%, {trade_type_cur}/{STATE.get('position_asset_class')}) with multiplier {trail_mult}", "INFO")
+                _advance_profit_stage(_tj.STAGE_TRAILING_ACTIVE, "trailing_activated")
+                _journal_trade_event(
+                    _tj.TRAILING_ACTIVE, symbol=symbol, side=side,
+                    reason=f"trailing stop armed at {synthetic_sl:.4f} (roe={roe:.2f}%)",
+                    state=STATE, level="INFO",
+                    metadata={"trail_mult": float(f"{trail_mult:.3f}")},
+                )
             if side == "BUY":
                 new_trail = mark_price - trail_mult * atr
                 if new_trail > STATE.get("trail_stop", 0):
@@ -4672,8 +4871,14 @@ class LiveTradeManager:
                 new_trail = mark_price + trail_mult * atr
                 if new_trail < STATE.get("trail_stop", float('inf')):
                     STATE["trail_stop"] = new_trail
+            # The ratchet absorbs the tightening trail into the protective stop
+            # so the exit floor stays monotonic and journaled.
+            _apply_protection_ratchet(symbol=symbol, mark_price=mark_price,
+                                      side=side, entry=entry, atr=atr,
+                                      reason="trailing_stop_merge")
             if (side == "BUY" and mark_price <= STATE.get("trail_stop", 0)) or (side == "SELL" and mark_price >= STATE.get("trail_stop", float('inf'))):
                 log_execution(f"[TRAIL] Stop hit at {mark_price:.4f} (trail={STATE['trail_stop']:.4f})", "WARN")
+                STATE["close_reason"] = "TRAILING_STOP"
                 close_position_full()
                 self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
                 DASHBOARD_STATE["live_trade_mode"] = False
@@ -4707,6 +4912,7 @@ class LiveTradeManager:
             )
             if action == "EXIT" and state_ppe.get("smart_money", {}).get("distribution_risk", 0) > 65 and momentum.get("momentum_decay", False):
                 log_execution("[PPE] Institutional exit signal – closing position", "WARN")
+                STATE["close_reason"] = STATE.get("close_reason") or "PROFIT_ENGINE_EXIT"
                 close_position_full()
                 self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
                 DASHBOARD_STATE["live_trade_mode"] = False
@@ -4733,6 +4939,7 @@ class LiveTradeManager:
         publish_position_state(symbol, side, entry, STATE.get("qty", 0.0), roe)
 
         if (side == "BUY" and mark_price <= STATE.get("synthetic_sl", 0)) or (side == "SELL" and mark_price >= STATE.get("synthetic_sl", 0)):
+            STATE["close_reason"] = STATE.get("close_reason") or "STOP_LOSS"
             close_position_full()
             self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
             DASHBOARD_STATE["live_trade_mode"] = False
@@ -4752,7 +4959,8 @@ def sync_position_state(symbol=None):
                 roe_pct = raw_pnl * LEVERAGE
                 STATE["roe_pct"] = roe_pct
                 STATE["mark_price"] = price
-                STATE["unrealized_pnl_usdt"] = (price - STATE["entry"]) * STATE["qty"] if STATE["side"]=="BUY" else (STATE["entry"] - price) * STATE["qty"]
+                open_qty = float(STATE.get("remaining_qty", 0.0) or 0.0) or float(STATE.get("qty", 0.0) or 0.0)
+                STATE["unrealized_pnl_usdt"] = (price - STATE["entry"]) * open_qty if STATE["side"]=="BUY" else (STATE["entry"] - price) * open_qty
                 return price, 0.0, 0.0, roe_pct
         return None, None, None, None
 
@@ -5927,7 +6135,39 @@ STATE = {
     "dynamic_tp2": 0.0,
     "market_session": None,
     "session_label": None,
-    "position_asset_class": "CRYPTO"
+    "position_asset_class": "CRYPTO",
+    # ---- Trade Management Safety Hardening (P0/P1 + profit lifecycle) ----
+    "trade_id": None,
+    "profit_stage": "NONE",
+    "protection_state": "NONE",
+    "protection_floor_sl": None,
+    "profit_locked_event_ts": None,
+    "profit_detected_ts": None,
+    "native_sl_state": "NONE",
+    "native_sl_order_id": None,
+    "native_sl_price": None,
+    "realized_pnl_usdt": 0.0,
+    "realized_pnl_pct": 0.0,
+    "realized_roe_pct": 0.0,
+    "realized_legs": 0,
+    "tp1_state": "NONE",
+    "tp1_order_id": None,
+    "tp1_fill_qty": 0.0,
+    "tp1_exec_price": None,
+    "tp1_event_ts": None,
+    "tp2_state": "NONE",
+    "tp2_event_ts": None,
+    "trail_activation_ts": None,
+    "exit_reason": None,
+    "final_result_class": None,
+    "duration_sec": None,
+    "position_status": "OPEN",
+    "sync_status": "OK",
+    "recovery_ts": None,
+    "recovered": False,
+    "close_reason": None,
+    "last_trade_summary": None,
+    "protection_events": [],
 }
 paper = {"balance": 10000.0, "position": None, "committed_margin": 0.0}
 _ACTIVE_TRADE = False
@@ -6081,6 +6321,447 @@ def update_position_dashboard(symbol, side, entry, qty, pnl=0.0):
 def clear_position_dashboard():
     DASHBOARD_STATE["position"] = None
 
+# ========== TRADE MANAGEMENT SAFETY HARDENING (P0/P1 + profit lifecycle) ==========
+# Constraints kept from the forensic plan:
+#   * LiveTradeManager remains the SL/TP/partial/trailing/final-close decision
+#     authority; these helpers only ADD hardening, journaling and monotonic
+#     protection. They never change entry/risk/sizing/leverage/cooldowns/ATOM.
+#   * Placement of exchange-native protection is guarded by the existing
+#     execution seam (ex.create_order) with the same params convention.
+#   * Everything is safe in PAPER_MODE (mock protection, no real orders).
+
+import core.trade_journal as _tj
+
+_TRADE_HARDENING_DEFAULTS = {
+    "trade_id": None,
+    "profit_stage": "NONE",
+    "protection_state": "NONE",
+    "protection_floor_sl": None,
+    "profit_locked_event_ts": None,
+    "profit_detected_ts": None,
+    "native_sl_state": "NONE",
+    "native_sl_order_id": None,
+    "native_sl_price": None,
+    "realized_pnl_usdt": 0.0,
+    "realized_pnl_pct": 0.0,
+    "realized_roe_pct": 0.0,
+    "realized_legs": 0,
+    "tp1_state": "NONE",
+    "tp1_order_id": None,
+    "tp1_fill_qty": 0.0,
+    "tp1_exec_price": None,
+    "tp1_event_ts": None,
+    "tp2_state": "NONE",
+    "tp2_event_ts": None,
+    "trail_activation_ts": None,
+    "exit_reason": None,
+    "final_result_class": None,
+    "duration_sec": None,
+    "position_status": "OPEN",
+    "sync_status": "OK",
+    "recovered": False,
+    "close_reason": None,
+    "last_trade_summary": None,
+    "protection_events": [],
+}
+
+
+def _ensure_trade_hardening_state(state=None):
+    """Idempotently initialise the P0/P1 hardening keys on the given state
+    (defaults to the global STATE). Safe to call on every open/adoption."""
+    target = state if isinstance(state, dict) else STATE
+    for _k, _v in _TRADE_HARDENING_DEFAULTS.items():
+        if _k not in target:
+            target[_k] = _v
+
+
+def _classify_trade_result(pnl_pct):
+    return _tj.classify_result(pnl_pct)
+
+
+def _tp_geometry_valid(side, entry, sl, tp1, tp2, min_dist=0.0):
+    return _tj.tp_geometry_valid(side, entry, sl, tp1, tp2, min_dist=min_dist)
+
+
+def _journal_trade_event(event, *, symbol="", side="", reason="", detail="",
+                         score=None, state=None, level="INFO", dedup_key=None,
+                         dedup_sec=0.0, human=None, metadata=None):
+    """Single engine seam for trade-lifecycle journaling: writes the tamper-
+    evident TRADE record AND a human log line. Never raises in production."""
+    st = state if isinstance(state, dict) else STATE
+    sym = symbol or st.get("current_symbol") or st.get("symbol") or ""
+    side_v = side or st.get("side") or ""
+    tid = st.get("trade_id")
+    record = _tj.journal_trade_event(
+        event=event, symbol=sym, side=side_v, trade_id=tid or "",
+        reason=reason, detail=detail, score=score, state=st,
+        metadata=metadata, dedup_key=dedup_key, dedup_sec=dedup_sec,
+    )
+    try:
+        if human is None:
+            human = f"[TRADE:{event}] {sym} {side_v} {reason}"
+        log_execution(f"{human}", level, debounce_key=dedup_key,
+                      debounce_sec=60 if dedup_sec else 0)
+    except Exception:
+        pass
+    # Part M: lifecycle notifications (tg send_once rate-limits each event).
+    try:
+        if event in (_tj.TRADE_OPENED, _tj.TP1_ELIGIBLE, _tj.TP1_EXECUTED,
+                     _tj.TP1_FAILED, _tj.TP2_EXECUTED, _tj.BREAKEVEN_RATCHET,
+                     _tj.PROFIT_LOCKED, _tj.TRAILING_ACTIVE, _tj.TRADE_CLOSED,
+                     _tj.EXTERNAL_CLOSE, _tj.RESTART_RECOVERY,
+                     _tj.POSITION_RECOVERED, _tj.PROFIT_DETECTED):
+            tg_trade_event(event, sym, None, reason[:120])
+    except Exception:
+        pass
+    return record
+
+
+def _generate_trade_id(symbol=None):
+    return _tj.make_trade_id(symbol or STATE.get("current_symbol") or "")
+
+
+def _advance_profit_stage(stage, reason="", *, state=None, journal=False):
+    """Forward-only profit-harvesting stage machine. Never steps backward.
+
+    stage-dedicated lifecycle events (TP1_EXECUTED, PROFIT_LOCKED, ...) are
+    journaled by their own explicit _journal_trade_event call sites, so the
+    stage machine does NOT emit a second copy (journal stays False by default).
+    """
+    st = state if isinstance(state, dict) else STATE
+    _ensure_trade_hardening_state(st)
+    cur = st.get("profit_stage") or "NONE"
+    want = _tj._RANK.get(str(stage))
+    have = _tj._RANK.get(str(cur))
+    if want is None:
+        return cur
+    if have is not None and want < have:
+        return cur
+    changed = cur != stage
+    st["profit_stage"] = stage
+    if journal and changed:
+        _journal_trade_event(
+            stage, symbol=st.get("current_symbol", ""), side=st.get("side", ""),
+            reason=reason or f"profit_stage -> {stage}", state=st,
+            level="INFO",
+        )
+    return stage
+
+
+def _mark_close_reason(reason):
+    """Record WHY a position is being closed so finalize/journal attribute it."""
+    STATE["close_reason"] = reason or STATE.get("close_reason") or "UNKNOWN"
+
+
+def _safe_prot_floor(side, candidate):
+    """Monotonic protective-stop floor: BUY ratchets UP only, SELL DOWN only.
+
+    The strategy still decides where the stop SHOULD be (synthetic_sl); this
+    enforces that the protective stop never moves backward against the trade,
+    independent of how the strategy recomputes its SL that tick. This is the
+    P0/P1 'never move a protective stop backward' invariant."""
+    side = str(side or "").upper()
+    if not STATE.get("tp1_hit", False) and STATE.get("protection_state", "NONE") in ("NONE", "BREAKEVEN"):
+        return candidate
+    floor = STATE.get("protection_floor_sl")
+    if floor is None:
+        floor = candidate
+    if side == "BUY":
+        new_floor = max(float(candidate or 0.0), float(floor or 0.0))
+    else:
+        new_floor = min(float(candidate or 0.0), float(floor or 0.0))
+    STATE["protection_floor_sl"] = new_floor
+    STATE["synthetic_sl"] = new_floor
+    return new_floor
+
+
+def _apply_protection_ratchet(*, symbol, mark_price, side, entry, atr, reason=""):
+    """Guaranteed-profit protection ratchet.
+
+    * After TP1 is banked -> protective stop is pinned to entry (breakeven),
+      journaled as BREAKEVEN_RATCHET (once).
+    * When trailing activates the ratchet continues from the trailing stop.
+    * PROFIT_LOCKED is only reported AFTER the ratchet actually moved the stop;
+      a failure to ratchet is journaled and never claims protection."""
+    side = str(side or "").upper()
+    entry = float(entry or 0.0)
+    atr = float(atr or 0.0)
+    cur_sl = float(STATE.get("synthetic_sl", 0.0) or 0.0)
+    prev_state = STATE.get("protection_state", "NONE")
+    prev_sl = STATE.get("protection_floor_sl", cur_sl)
+
+    if STATE.get("tp1_hit", False) or STATE.get("trail_activated", False):
+        if STATE.get("protection_state", "NONE") == "NONE":
+            if STATE.get("tp1_hit", False):
+                if side == "BUY":
+                    sl = max(cur_sl, entry)
+                else:
+                    sl = min(cur_sl, entry)
+                STATE["protection_state"] = "BREAKEVEN"
+                STATE["protection_floor_sl"] = sl
+                STATE["synthetic_sl"] = sl
+                _advance_profit_stage(_tj.STAGE_TP1_EXECUTED, "tp1_banked")
+                _journal_trade_event(
+                    _tj.BREAKEVEN_RATCHET, symbol=symbol, side=side,
+                    reason=f"protective stop pinned to entry {sl:.4f}", state=STATE,
+                    level="INFO",
+                    metadata={"sl_before": prev_sl, "sl_after": sl, "entry": entry,
+                              "protection_state": "BREAKEVEN"},
+                )
+                return True
+
+    if STATE.get("tp1_hit", False):
+        # Post-TP1 the ratchet continues from the best valuation of the stop
+        # (strategy synthetic_sl and/or an active trailing stop). It can only
+        # move forward — backwards moves are rejected by _safe_prot_floor.
+        if side == "BUY":
+            new_sl = max(cur_sl, float(STATE.get("trail_stop", 0) or 0))
+        else:
+            trail = float(STATE.get("trail_stop", 0) or 0)
+            if trail > 0:
+                new_sl = min(cur_sl or trail, trail)
+            else:
+                new_sl = cur_sl
+        new_floor = _safe_prot_floor(side, new_sl)
+        moved_forward = (new_floor > prev_sl) if side == "BUY" else (new_floor < prev_sl)
+        if moved_forward and STATE.get("protection_state") != "PROFIT_LOCK":
+            STATE["protection_state"] = "BREAKEVEN"
+        if new_floor != prev_sl:
+            _journal_trade_event(
+                _tj.PROTECTION_UPDATE, symbol=symbol, side=side,
+                reason=reason or f"monotonic protective stop {prev_sl:.4f} -> {new_floor:.4f}",
+                state=STATE, level="INFO",
+                metadata={"sl_before": prev_sl, "sl_after": new_floor,
+                          "mark_price": mark_price, "protection_state": STATE["protection_state"]},
+                dedup_key=f"prot_update_{symbol}", dedup_sec=30,
+            )
+            return True
+    return False
+
+
+def _profit_lock_then_journal(*, symbol, side, reason):
+    """Only after the protective ratchet landed do we claim PROFIT_LOCKED."""
+    if STATE.get("protection_state") in ("BREAKEVEN", "PROFIT_LOCK"):
+        STATE["profit_lock_activated"] = True
+        STATE["protection_state"] = "PROFIT_LOCK"
+        STATE["profit_locked_event_ts"] = time.time()
+        _advance_profit_stage(_tj.STAGE_PROFIT_LOCKED, "profit_locked")
+        _journal_trade_event(
+            _tj.PROFIT_LOCKED, symbol=symbol, side=side, reason=reason, state=STATE,
+            level="SUCCESS",
+            metadata={"protection_state": "PROFIT_LOCK",
+                      "profit_lock_activated": True},
+        )
+        return True
+    _journal_trade_event(
+        _tj.PROFIT_LOCK_FAILED, symbol=symbol, side=side,
+        reason=reason or "protective ratchet did not land; profit lock NOT claimed",
+        state=STATE, level="WARN",
+        metadata={"profit_lock_activated": False},
+        dedup_key=f"plock_fail_{symbol}", dedup_sec=15,
+    )
+    return False
+
+
+def _on_profit_detected(symbol, roe):
+    """First profitable unseen tick -> PROFIT_DETECTED (once per trade). Unrealized."""
+    if roe is None or roe <= 0:
+        return False
+    if STATE.get("profit_detected_ts"):
+        return False
+    STATE["profit_detected_ts"] = time.time()
+    _advance_profit_stage(_tj.STAGE_PROFIT_DETECTED, "unrealized_profit_detected")
+    _journal_trade_event(
+        _tj.PROFIT_DETECTED, symbol=symbol, side=STATE.get("side", ""),
+        reason=f"first profitable tick roe={roe:.2f}% (unrealized)", state=STATE,
+        level="INFO",
+    )
+    return True
+
+
+def _position_status_unknown(symbol, source):
+    STATE["position_status"] = "UNKNOWN"
+    STATE["sync_status"] = str(source) if source else "ERROR"
+    _journal_trade_event(
+        _tj.POSITION_STATUS_UNKNOWN, symbol=symbol, side=STATE.get("side", ""),
+        reason=f"exchange could not answer ({source}); position state UNKNOWN",
+        state=STATE, level="WARN",
+        metadata={"source": source, "position_status": "UNKNOWN"},
+        dedup_key=f"pos_unknown_{symbol}", dedup_sec=30,
+    )
+
+
+# ---- P0-3: exchange-native protective STOP_MARKET reduceOnly SL ------------
+def _native_sl_delta(current, target):
+    try:
+        return abs(float(current or 0.0) - float(target or 0.0))
+    except Exception:
+        return float("inf")
+
+
+def place_native_sl(symbol=None):
+    """Place the single native protective STOP_MARKET reduceOnly SL for the
+    active position. Idempotent: if an ACTIVE native SL exists we do nothing
+    (no duplicate protection). In PAPER_MODE the order is mocked/registered and
+    journaled exactly like the live path. Never raises."""
+    try:
+        symbol = symbol or STATE.get("current_symbol")
+        if not STATE.get("open") or not symbol:
+            return None
+        if STATE.get("native_sl_state") == "ACTIVE":
+            return STATE.get("native_sl_order_id")
+        side = STATE.get("side")
+        qty = float(STATE.get("remaining_qty") or 0.0)
+        sl_price = float(STATE.get("synthetic_sl") or 0.0)
+        if qty <= 0 or sl_price <= 0:
+            return None
+        if PAPER_MODE:
+            order_id = f"paper_native_sl_{symbol.replace('/', '_')}_{int(time.time()*1000)}"
+            STATE["native_sl_order_id"] = order_id
+            STATE["native_sl_price"] = sl_price
+            STATE["native_sl_state"] = "ACTIVE"
+            _journal_trade_event(
+                _tj.NATIVE_SL_PLACED, symbol=symbol, side=side,
+                reason=f"paper native STOP_MARKET reduceOnly @ {sl_price:.4f} qty={qty:.6f}",
+                state=STATE, level="INFO",
+                metadata={"order_id": order_id, "sl_price": sl_price,
+                          "price": sl_price, "mode": "PAPER"},
+            )
+            return order_id
+        sym = normalize_symbol(symbol)
+        order_side = "sell" if side == "BUY" else "buy"
+        order = safe_api_call(
+            ex.create_order, sym, "STOP_MARKET", order_side,
+            float(ex.amount_to_precision(sym, qty)),
+            params={"stopPrice": sl_price, "reduceOnly": True,
+                    "positionSide": _hedge_position_side(side)},
+        )
+        if order is None or not order.get("id"):
+            raise RuntimeError("native SL order creation returned no id")
+        order_id = order["id"]
+        STATE["native_sl_order_id"] = order_id
+        STATE["native_sl_price"] = sl_price
+        STATE["native_sl_state"] = "ACTIVE"
+        _journal_trade_event(
+            _tj.NATIVE_SL_PLACED, symbol=symbol, side=side,
+            reason=f"native STOP_MARKET reduceOnly @ {sl_price:.4f} qty={qty:.6f}",
+            state=STATE, level="INFO",
+            metadata={"order_id": order_id, "sl_price": sl_price, "mode": "LIVE"},
+        )
+        return order_id
+    except Exception as e:
+        STATE["native_sl_state"] = "FAILED"
+        _journal_trade_event(
+            _tj.NATIVE_SL_FAILED, symbol=symbol or STATE.get("current_symbol"),
+            side=STATE.get("side", ""), reason=f"native SL placement failed: {e}",
+            state=STATE, level="ERROR",
+            metadata={"native_sl_state": "FAILED"},
+        )
+        try:
+            tg_error(f"Native protective SL could not be placed: {e}", "PROTECTIVE_SL")
+        except Exception:
+            pass
+        return None
+
+
+def update_native_sl(sl_price=None):
+    """Ratchet the native protective SL. Never moves backward; no duplicate
+    updates for identical prices. Best-effort; a failure journals but leaves
+    the synthetic protection fully active."""
+    try:
+        if STATE.get("native_sl_state") != "ACTIVE":
+            return False
+        if sl_price is None:
+            sl_price = float(STATE.get("synthetic_sl") or 0.0)
+        if sl_price <= 0:
+            return False
+        prev = STATE.get("native_sl_price")
+        if _native_sl_delta(prev, sl_price) < 1e-9:
+            return False
+        side = str(STATE.get("side", "")).upper()
+        if side == "BUY" and prev is not None and float(sl_price) < float(prev):
+            return False
+        if side == "SELL" and prev is not None and float(sl_price) > float(prev):
+            return False
+        if PAPER_MODE:
+            STATE["native_sl_price"] = sl_price
+            _journal_trade_event(
+                _tj.NATIVE_SL_UPDATED, symbol=STATE.get("current_symbol"),
+                side=STATE.get("side", ""),
+                reason=f"native SL {prev} -> {sl_price} (monotonic)",
+                state=STATE, level="INFO",
+                metadata={"sl_before": prev, "sl_after": sl_price, "mode": "PAPER"},
+            )
+            return True
+        order_id = STATE.get("native_sl_order_id")
+        if not order_id:
+            return False
+        # Best-effort: cancel + re-place at the new (never backward) price.
+        try:
+            safe_api_call(ex.cancel_order, order_id, normalize_symbol(STATE.get("current_symbol")))
+        except Exception:
+            pass
+        place_native_sl(symbol=STATE.get("current_symbol"))
+        return True
+    except Exception as e:
+        _journal_trade_event(
+            _tj.NATIVE_SL_FAILED, symbol=STATE.get("current_symbol"),
+            side=STATE.get("side", ""), reason=f"native SL update failed: {e}",
+            state=STATE, level="ERROR",
+            dedup_key=f"native_sl_update_fail_{STATE.get('current_symbol')}", dedup_sec=30,
+        )
+        return False
+
+
+def cancel_native_sl():
+    """Cancel the native protective SL on close (best effort, never blocks)."""
+    try:
+        if STATE.get("native_sl_state") != "ACTIVE":
+            return True
+        order_id = STATE.get("native_sl_order_id")
+        had_id = bool(order_id)
+        if PAPER_MODE:
+            STATE["native_sl_state"] = "CANCELLED"
+            _journal_trade_event(
+                _tj.NATIVE_SL_CANCELLED, symbol=STATE.get("current_symbol"),
+                side=STATE.get("side", ""),
+                reason=f"native SL cancelled (paper) order_id={order_id}",
+                state=STATE, level="INFO",
+                metadata={"order_id": order_id, "mode": "PAPER"},
+            )
+            return True
+        if had_id:
+            try:
+                safe_api_call(ex.cancel_order, order_id, normalize_symbol(STATE.get("current_symbol")))
+            except Exception as e:
+                log_execution(f"[NATIVE_SL] cancel best-effort failed: {e}", "WARN")
+        STATE["native_sl_state"] = "CANCELLED"
+        _journal_trade_event(
+            _tj.NATIVE_SL_CANCELLED, symbol=STATE.get("current_symbol"),
+            side=STATE.get("side", ""),
+            reason=f"native SL cancelled order_id={order_id}",
+            state=STATE, level="INFO",
+            metadata={"order_id": order_id, "mode": "LIVE"},
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _protect_wire_on_tick(*, symbol, mark_price, side, entry, atr):
+    """Single per-tick hook aligning native SL with the ratcheted protective
+    stop. Runs after the strategy has computed its levels; purely additive."""
+    try:
+        if not STATE.get("open"):
+            return
+        _apply_protection_ratchet(symbol=symbol, mark_price=mark_price,
+                                  side=side, entry=entry, atr=atr)
+        if STATE.get("tp1_hit", False) or STATE.get("trail_activated", False) or STATE.get("protection_state") in ("BREAKEVEN", "PROFIT_LOCK"):
+            if STATE.get("native_sl_state") == "ACTIVE":
+                update_native_sl(float(STATE.get("synthetic_sl") or 0.0))
+    except Exception:
+        pass
+
 # ========== FULL log_execution (debounce + dashboard) ==========
 def log_execution(msg, level="INFO", debounce_key=None, debounce_sec=60):
     # Never touch buffered stdout/stderr once interpreter shutdown has begun.
@@ -6107,7 +6788,13 @@ def log_execution(msg, level="INFO", debounce_key=None, debounce_sec=60):
     DASHBOARD_STATE["logs"].append(entry)
     if len(DASHBOARD_STATE["logs"]) > 200:
         DASHBOARD_STATE["logs"].pop(0)
-    print(colored)
+    try:
+        print(colored)
+    except UnicodeEncodeError:
+        # Some Windows consoles/pipes are cp1252 and cannot encode decorative
+        # glyphs (🟢🔴✅❌). A logging print must NEVER abort the manage cycle
+        # or silently swallow the tail of a trade exit, so degrade to ASCII.
+        print(colored.encode("ascii", "replace").decode("ascii"))
     if level == "ERROR":
         DASHBOARD_STATE["errors"].append(entry)
         if len(DASHBOARD_STATE["errors"]) > 50:
@@ -6475,6 +7162,11 @@ def finalize_trade_with_reality(symbol):
     mark_price, unrealized, initial_margin, roe = sync_position_state(symbol)
     if mark_price is None and not PAPER_MODE:
         mark_price = get_ticker_safe(symbol)
+    # P0-3: the venue-native protective stop must be released when we close.
+    try:
+        cancel_native_sl(symbol)
+    except Exception:
+        pass
     pnl_usdt = 0.0
     pnl_pct = 0.0
     booked_usdt = sum(float(l.get("pnl_usdt", 0.0) or 0.0) for l in STATE.get("partial_realized", []))
@@ -6526,6 +7218,12 @@ def finalize_trade_with_reality(symbol):
         pnl_pct = booked_pct + final_pct
         pnl_usdt = booked_usdt + final_usdt
     _credit_realized_pnl(final_pct, final_usdt, symbol)
+    # ---- P0/P1: final-leg realized accretion + classified TRADE_CLOSED ----
+    STATE["realized_pnl_usdt"] = float(STATE.get("realized_pnl_usdt", 0.0) or 0.0) + float(final_usdt or 0.0)
+    STATE["realized_pnl_pct"] = float(STATE.get("realized_pnl_pct", 0.0) or 0.0) + float(final_pct or 0.0)
+    _margin_f = float(STATE.get("margin", 0.0) or 0.0)
+    if _margin_f > 0:
+        STATE["realized_roe_pct"] = STATE["realized_pnl_usdt"] / _margin_f * 100
     PERF["trades"] += 1
     if pnl_pct >= 0:
         PERF["wins"] += 1
@@ -6533,6 +7231,47 @@ def finalize_trade_with_reality(symbol):
     else:
         PERF["losses"] += 1
         result = "LOSS"
+    result_classed = _classify_trade_result(pnl_pct)
+    STATE["final_result_class"] = result_classed
+    entry_time = STATE.get("entry_time") or STATE.get("last_update_ts") or time.time()
+    try:
+        _entry_ts = float(entry_time)
+    except (TypeError, ValueError):
+        _entry_ts = time.time()
+    duration_sec = max(0.0, time.time() - _entry_ts)
+    STATE["duration_sec"] = duration_sec
+    exit_reason = STATE.get("close_reason") or STATE.get("exit_reason") or "STANDARD_EXIT"
+    STATE["exit_reason"] = exit_reason
+    trade_id = STATE.get("trade_id")
+    symbol_for = STATE.get("current_symbol") or symbol
+    side_for = STATE.get("side")
+    peak_roe = float(STATE.get("peak_roe", 0.0) or 0.0)
+    peak_uni = float(STATE.get("peak_unrealized_pnl", 0.0) or 0.0)
+    booked_legs = int(STATE.get("realized_legs", 0) or 0)
+    _journal_trade_event(
+        _tj.TRADE_CLOSED, symbol=symbol_for, side=side_for,
+        reason=f"result={result_classed} exit_reason={exit_reason} "
+               f"pnl_pct={pnl_pct:+.2f}% pnl_usdt={pnl_usdt:+.2f} "
+               f"peak_roe={peak_roe:.2f}% legs={booked_legs}",
+        state=STATE, level=("SUCCESS" if pnl_pct >= 0 else "ERROR"),
+        metadata={
+            "trade_id": trade_id, "result": result_classed,
+            "exit_reason": exit_reason, "duration_sec": duration_sec,
+            "booked_usdt": booked_usdt, "booked_pct": booked_pct,
+            "final_usdt": final_usdt, "final_pct": final_pct,
+            "realized_pnl_usdt": STATE["realized_pnl_usdt"],
+            "realized_pnl_pct": STATE["realized_pnl_pct"],
+            "peak_roe": peak_roe, "peak_unrealized_pnl": peak_uni,
+        },
+    )
+    STATE["last_trade_summary"] = {
+        "trade_id": trade_id, "symbol": symbol_for, "side": side_for,
+        "result": result_classed, "exit_reason": exit_reason,
+        "pnl_pct": pnl_pct, "pnl_usdt": pnl_usdt,
+        "realized_pnl_usdt": STATE["realized_pnl_usdt"],
+        "realized_pnl_pct": STATE["realized_pnl_pct"],
+        "peak_roe": peak_roe, "duration_sec": duration_sec, "legs": booked_legs,
+    }
     PERF["last_trade"] = {"result": result, "pnl_pct": pnl_pct, "pnl_usdt": pnl_usdt}
     TRADE_STATE.update({
         "in_position": False,
@@ -6548,10 +7287,9 @@ def finalize_trade_with_reality(symbol):
         "reason": []
     })
     DASHBOARD_STATE["live_trade_mode"] = False
-    log_execution(f"Trade closed: {result} {pnl_pct:.2f}% | USDT: {pnl_usdt:+.2f}", "SUCCESS" if pnl_pct>=0 else "ERROR")
-    entry_time = STATE.get("entry_time") or STATE.get("last_update_ts") or time.time()
-    tg_close(STATE.get("current_symbol") or "UNKNOWN", pnl_pct,
-             max(0.0, (time.time() - entry_time)) / 60.0, STATE.get("side"))
+    log_execution(f"Trade closed: {result_classed} ({result}) {pnl_pct:.2f}% | USDT: {pnl_usdt:+.2f} | peak ROE {peak_roe:.2f}%", "SUCCESS" if pnl_pct>=0 else "ERROR")
+    tg_close(symbol_for or "UNKNOWN", pnl_pct,
+             duration_sec / 60.0, side_for)
     with _TRADE_LOCK:
         STATE["open"] = False
         STATE["side"] = None
@@ -6582,6 +7320,28 @@ def finalize_trade_with_reality(symbol):
         STATE["dynamic_reversal_exit_done"] = False
         STATE["dynamic_exhaustion_protect_done"] = False
         STATE["dynamic_partial_done"] = False
+        # Trade Management Safety Hardening: neutralise lifecycle/protection
+        # fields (the TRADE_CLOSED record already captured the full summary).
+        STATE["profit_stage"] = "NONE"
+        STATE["protection_state"] = "NONE"
+        STATE["protection_floor_sl"] = None
+        STATE["profit_locked_event_ts"] = None
+        STATE["profit_detected_ts"] = None
+        STATE["native_sl_state"] = "NONE"
+        STATE["native_sl_order_id"] = None
+        STATE["native_sl_price"] = None
+        STATE["tp1_state"] = "NONE"
+        STATE["tp1_order_id"] = None
+        STATE["tp1_fill_qty"] = 0.0
+        STATE["tp1_exec_price"] = None
+        STATE["tp1_event_ts"] = None
+        STATE["tp2_state"] = "NONE"
+        STATE["tp2_event_ts"] = None
+        STATE["trail_activation_ts"] = None
+        STATE["position_status"] = "OPEN"
+        STATE["sync_status"] = "OK"
+        STATE["recovery_ts"] = None
+        STATE["recovered"] = False
         if _live_manager is not None:
             _live_manager.position_profile = None
             _live_manager._last_position_action = None
@@ -7358,6 +8118,10 @@ def _reconcile_levels_after_fill(actual_entry, symbol, side, trade_type, classif
                 f"old sl={old['sl']:.6f}/tp1={old['tp1']:.6f}/tp2={old['tp2']:.6f} -> "
                 f"new sl={n_sl:.6f}/tp1={n_tp1:.6f}/tp2={n_tp2:.6f} "
                 f"correction_reason=geometry_guard", "INFO")
+        # Native SL ownership lives with the management wiring (P0-3), which
+        # places/amends the venue stop when the protection state advances. The
+        # fill-reconcile path only corrects LEVELS; adoption (open-timeout
+        # recovery) is a pure READ and must never emit orders.
         return changed or diverged
     except Exception as e:
         log_execution(f"[FILL_RECONCILE] error: {e}", "WARN")
@@ -7386,6 +8150,21 @@ def _record_partial_leg(side, qty, price, entry, pnl_pct, pnl_usdt, mode="PAPER"
            "pnl_usdt": float(pnl_usdt or 0.0), "ts": time.time(), "mode": mode}
     STATE.setdefault("partial_realized", []).append(leg)
     _credit_realized_pnl(pnl_pct, pnl_usdt, STATE.get("current_symbol") or STATE.get("symbol"))
+    # ---- P0/P1 realized PnL accretion (single source for payload/journal) ----
+    STATE["realized_pnl_usdt"] = float(STATE.get("realized_pnl_usdt", 0.0) or 0.0) + float(pnl_usdt or 0.0)
+    STATE["realized_pnl_pct"] = float(STATE.get("realized_pnl_pct", 0.0) or 0.0) + float(pnl_pct or 0.0)
+    _margin = float(STATE.get("margin", 0.0) or 0.0)
+    if _margin > 0:
+        STATE["realized_roe_pct"] = STATE["realized_pnl_usdt"] / _margin * 100
+    STATE["realized_legs"] = int(STATE.get("realized_legs", 0) or 0) + 1
+    _journal_trade_event(
+        _tj.PARTIAL_CLOSE, symbol=STATE.get("current_symbol") or STATE.get("symbol"),
+        side=side, reason=f"leg qty={leg['qty']} price={leg['price']} "
+                          f"pnl_pct={leg['pnl_pct']:+.2f}% pnl_usdt={leg['pnl_usdt']:+.2f}",
+        state=STATE, level="INFO",
+        metadata={"leg": {k: (float(v) if isinstance(v, (int, float)) else v)
+                          for k, v in leg.items()}},
+    )
 
 
 def _live_entry_context(symbol, fallback_price, fallback_atr):
@@ -7764,7 +8543,7 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
 
     # ---- Execute trade ----
     if PAPER_MODE:
-        paper["position"] = {"side": side, "entry": price, "qty": qty, "remaining_qty": qty}
+        paper["position"] = {"symbol": symbol, "side": side, "entry": price, "qty": qty, "remaining_qty": qty}
         STATE.update({
             "open": True, "side": side, "entry": price, "qty": qty, "remaining_qty": qty,
             "sl": sl, "current_symbol": symbol, "tp1_done": False, "trail_activated": False,
