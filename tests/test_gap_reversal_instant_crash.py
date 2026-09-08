@@ -17,7 +17,8 @@ The test then answers the exchange-fill checklist WITHOUT touching production
 code:
 
   - Was a close order actually sent?            (venue order log)
-  - Was it reduceOnly=True + correct positionSide? (order params)
+  - Was it a valid hedge close (positionSide LONG/SHORT, reduceOnly ABSENT)?
+                                                (order params — DEV-01 contract fix)
   - Was the fill verified?                      (real verify_order_filled ->
                                                  venue fetch_order 'closed')
   - Was the position re-read from the venue?    (fetch_positions after close)
@@ -26,14 +27,20 @@ code:
   - What is the final realized PnL?             (PERF total == venue-derived)
 
 CRITICAL DISTINCTION (per the audit finding):
-If the engine were BROKEN the assertions on order/reduceOnly/verify/re-read/
+If the engine were BROKEN the assertions on order/side/verify/re-read/
 consistency would fail. A NEGATIVE realized number after an instant gap is NOT
 such a failure: it is the natural slippage of a single-bar crash - the venue
-fills the reduce-only close AT the gap price. The test therefore asserts the
+fills the hedge close AT the gap price. The test therefore asserts the
 realized value equals EXACTLY what the venue's own fills imply
 (sig * (fill - entry) * qty), i.e. the loss is fully accounted for by the gap
 fill, and that the outcome is never WORSE than a naked position closed at the
 same gap price (protection cost nothing extra).
+
+HEDGE-CLOSE MODEL (BingX Docs-v3, DEV-01 contract fix): closes run on
+positionSide=LONG/SHORT WITHOUT reduceOnly, so the fake venue decides a market
+order "closes" when its positionSide matches the open leg and its side opposes
+that leg (SELL on LONG, BUY on SHORT).  This is exactly how the real exchange
+leg semantics work in Hedge Mode.
 
 Nothing is copied from the audited SNIPER script; this mirrors the repo's own
 harness (real engine + PortfolioManager + the order-fake pattern introduced by
@@ -80,10 +87,12 @@ class FakeVenue:
     """Order-level fake BingX venue (same shape as tests/test_position_side_lifecycle.py).
 
     Stateful on the position: a plain 'market' entry order OPENS the position,
-    a 'market' reduceOnly order REDUCES/CLOSES it at the current venue price.
-    STOP_MARKET orders (native SL placement) are recorded but never move the
-    position. Every fetch_* reflects the resulting state in real time, so the
-    engine really verifies fills and re-reads the position from this venue.
+    a 'market' hedge close order (positionSide matching the open leg, opposing
+    side, NO reduceOnly — the DEV-01 contract) REDUCES/CLOSES it at the current
+    venue price.  STOP_MARKET orders (native SL placement) are recorded but
+    never move the position. Every fetch_* reflects the resulting state in real
+    time, so the engine really verifies fills and re-reads the position from
+    this venue.
 
     The venue price is driven by the test (set `fx.price` before each tick ==
     the live mark), which is exactly how an instant crash is modelled: one
@@ -102,7 +111,7 @@ class FakeVenue:
         self.position = None      # None or {"qty", "entry"} for this venue
         self.fetch_order_calls = 0
         self.fetch_positions_results = []   # snapshots after each call
-        self.reduce_only_closes = []        # (side, qty, params) closes
+        self.reduce_only_closes = []        # hedge close ledger: (side, qty, params)
         self.markets = {
             symbol: {
                 "id": symbol,
@@ -122,9 +131,18 @@ class FakeVenue:
         return f"fx-{self._seq}"
 
     def _apply_market_fill(self, side, amount, params):
-        """Book an order, and for real market orders move the venue position."""
+        """Book an order, and for real market orders move the venue position.
+
+        Hedge-leg semantics (DEV-01 contract): a market order CLOSES when its
+        positionSide matches the open leg AND its side opposes that leg
+        (SELL+LONG reduces LONG, BUY+SHORT reduces SHORT) — with or without
+        reduceOnly.  An order whose positionSide matches its own direction
+        (BUY+LONG / SELL+SHORT) OPENS that leg.  STOP_MARKET is handled by the
+        caller and never moves the position.
+        """
         oid = self._next_id()
         filled = float(amount)
+        hedge_side = params.get("positionSide")
         order = {
             "id": oid,
             "clientOrderId": params.get("clientOrderId"),
@@ -137,33 +155,44 @@ class FakeVenue:
             "average": self.price,
             "status": "closed",
             "reduceOnly": bool(params.get("reduceOnly", False)),
-            "positionSide": params.get("positionSide"),
+            "positionSide": hedge_side,
         }
         self.orders[oid] = order
         if params.get("clientOrderId"):
             self.orders_by_cid[params["clientOrderId"]] = oid
 
-        if bool(params.get("reduceOnly", False)):
-            cur = self.position
-            if cur is not None:
-                qty = cur["qty"]
-                closed = min(filled, qty)
-                cur["qty"] = qty - closed
-                self.fills.append({"id": oid, "symbol": self.symbol, "side": side,
-                                   "amount": closed, "price": self.price,
-                                   "fee": {"cost": 0.0, "currency": "USDT"},
-                                   "timestamp": time.time()})
-                if cur["qty"] <= 0:
-                    self.position = None
-            self.reduce_only_closes.append((side, closed if cur is not None else filled,
-                                            dict(params)))
-        else:
+        cur = self.position
+        closes_leg = None
+        if cur is not None:
+            leg = "LONG" if cur.get("side") == "long" else "SHORT"
+            if (hedge_side == leg and
+                    ((side == "sell" and leg == "LONG") or
+                     (side == "buy" and leg == "SHORT"))):
+                closes_leg = leg
+
+        if closes_leg is not None:
+            qty = cur["qty"]
+            closed = min(filled, qty)
+            cur["qty"] = qty - closed
+            self.fills.append({"id": oid, "symbol": self.symbol, "side": side,
+                               "amount": closed, "price": self.price,
+                               "fee": {"cost": 0.0, "currency": "USDT"},
+                               "timestamp": time.time()})
+            if cur["qty"] <= 0:
+                self.position = None
+            self.reduce_only_closes.append((side, closed, dict(params)))
+        elif hedge_side in ("LONG", "SHORT") and (
+                (side == "buy") == (hedge_side == "LONG")):
+            # hedge OPEN of the corresponding leg (BUY+LONG / SELL+SHORT)
             self.position = {"symbol": self.symbol, "qty": filled, "entry": self.price,
-                             "side": "short" if side == "sell" else "long"}
+                             "side": "long" if hedge_side == "LONG" else "short"}
             self.fills.append({"id": oid, "symbol": self.symbol, "side": side,
                                "amount": filled, "price": self.price,
                                "fee": {"cost": 0.0, "currency": "USDT"},
                                "timestamp": time.time()})
+        else:
+            # unmatched hedge order (e.g. SELL+LONG with no open leg): no-op.
+            self.reduce_only_closes.append((side, 0.0, dict(params)))
         return order
 
     # ---- ccxt surface ----
@@ -586,8 +615,8 @@ class GapReversalInstantCrashTest(unittest.TestCase):
         close_side = "sell" if side == "BUY" else "buy"
         pos_side = "LONG" if side == "BUY" else "SHORT"
         for c_side, c_qty, c_params in new_closes:
-            self.assertTrue(c_params.get("reduceOnly") is True,
-                            f"{side} close order not reduceOnly: {c_params}")
+            self.assertNotIn("reduceOnly", c_params,
+                             f"{side} hedge close must NOT carry reduceOnly (DEV-01): {c_params}")
             self.assertEqual(c_params.get("positionSide"), pos_side,
                              f"{side} close order wrong positionSide: {c_params}")
             if c_params.get("positionSide") is not None:
@@ -682,8 +711,9 @@ class GapReversalInstantCrashTest(unittest.TestCase):
         last = E.PERF.get("last_trade") or {}
         realized = float(E.PERF["total_pnl_usdt"])
         # The report must EXPLICITLY distinguish engine failure from slippage:
-        # exit reason + verify + re-read + reduceOnly + qty==0 are the engine's
-        # duty (all asserted above); the realized number is the venue's fill.
+        # exit reason + verify + re-read + hedge-close shape + qty==0 are the
+        # engine's duty (all asserted above); the realized number is the
+        # venue's fill.
         self.report = rep
 
 

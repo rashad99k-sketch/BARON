@@ -146,23 +146,25 @@ class PositionSideCloseOrders(unittest.TestCase):
             p.start()
         self.addCleanup(lambda: [p.stop() for p in self.patches])
 
-    # TEST 3 — CLOSE LONG (reduceOnly preserved)
+    # TEST 3 — CLOSE LONG (hedge close: positionSide preserved, NO reduceOnly)
     def test_close_partial_long(self):
         engine.STATE["side"] = "BUY"
         engine.close_partial(0.5)
         rec = engine.ex.created[0]
         self.assertEqual(rec["side"], "sell")
         self.assertEqual(rec["params"]["positionSide"], "LONG")
-        self.assertEqual(rec["params"]["reduceOnly"], True)
+        self.assertNotIn("reduceOnly", rec["params"],
+                         "hedge close must NOT carry reduceOnly (DEV-01)")
 
-    # TEST 4 — CLOSE SHORT (reduceOnly preserved)
+    # TEST 4 — CLOSE SHORT (hedge close: positionSide preserved, NO reduceOnly)
     def test_close_partial_short(self):
         engine.STATE["side"] = "SELL"
         engine.close_partial(0.5)
         rec = engine.ex.created[0]
         self.assertEqual(rec["side"], "buy")
         self.assertEqual(rec["params"]["positionSide"], "SHORT")
-        self.assertEqual(rec["params"]["reduceOnly"], True)
+        self.assertNotIn("reduceOnly", rec["params"],
+                         "hedge close must NOT carry reduceOnly (DEV-01)")
 
     # TEST 7 — FULL CLOSE LONG
     def test_close_full_long(self):
@@ -171,7 +173,8 @@ class PositionSideCloseOrders(unittest.TestCase):
         rec = engine.ex.created[0]
         self.assertEqual(rec["side"], "sell")
         self.assertEqual(rec["params"]["positionSide"], "LONG")
-        self.assertEqual(rec["params"]["reduceOnly"], True)
+        self.assertNotIn("reduceOnly", rec["params"],
+                         "hedge close must NOT carry reduceOnly (DEV-01)")
 
     # TEST 8 — FULL CLOSE SHORT
     def test_close_full_short(self):
@@ -180,7 +183,8 @@ class PositionSideCloseOrders(unittest.TestCase):
         rec = engine.ex.created[0]
         self.assertEqual(rec["side"], "buy")
         self.assertEqual(rec["params"]["positionSide"], "SHORT")
-        self.assertEqual(rec["params"]["reduceOnly"], True)
+        self.assertNotIn("reduceOnly", rec["params"],
+                         "hedge close must NOT carry reduceOnly (DEV-01)")
 
     # TEST 5 — PARTIAL CLOSE LONG keeps LONG
     def test_partial_close_long_position_side_stays_long(self):

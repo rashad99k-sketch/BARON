@@ -21,7 +21,7 @@ Scenarios covered (A-I from the production request):
   F  recovered LONG without protection -> existing TP/SL init runs once.
   G  recovered position reaches the management loop + Dashboard logs.
   H  partial/full close after a recovered position preserves PositionSide
-     and reduceOnly.
+     (hedge close; reduceOnly NOT sent per DEV-01 contract fix).
   I  duplicate reconciliation cycle -> same position not re-registered and
      no second order is created.
 """
@@ -371,7 +371,7 @@ class ManagementLoopAfterRecoveryTest(TimeoutRecoveryBase):
 
 
 class CloseAfterRecoveryTest(TimeoutRecoveryBase):
-    """Scenario H: close path preserves Hedge PositionSide + reduceOnly."""
+    """Scenario H: close path preserves Hedge PositionSide (no reduceOnly)."""
 
     @contextmanager
     def _patch_close(self, pos_return):
@@ -396,10 +396,10 @@ class CloseAfterRecoveryTest(TimeoutRecoveryBase):
         remaining = FakeVenue.position(side="long", contracts=0.05, entry=100.0,
                                        pid="pos-long")
         with self._patch_close(remaining):
-            engine.close_partial(0.5)               # SELL + reduceOnly + LONG
+            engine.close_partial(0.5)               # SELL + hedge LONG (no reduceOnly)
         engine.STATE["remaining_qty"] = 0.05
         with self._patch_close(None):
-            engine.close_position_full()            # SELL + reduceOnly + LONG
+            engine.close_position_full()            # SELL + hedge LONG (no reduceOnly)
 
         self.assertEqual(len(self.fx.created), 3)
         open_rec, partial_rec, final_rec = self.fx.created
@@ -410,11 +410,13 @@ class CloseAfterRecoveryTest(TimeoutRecoveryBase):
         # PARTIAL CLOSE LONG
         self.assertEqual(partial_rec["side"], "sell")
         self.assertEqual(partial_rec["params"]["positionSide"], "LONG")
-        self.assertEqual(partial_rec["params"]["reduceOnly"], True)
+        self.assertNotIn("reduceOnly", partial_rec["params"],
+                         "hedge close must NOT carry reduceOnly (DEV-01)")
         # FINAL CLOSE LONG
         self.assertEqual(final_rec["side"], "sell")
         self.assertEqual(final_rec["params"]["positionSide"], "LONG")
-        self.assertEqual(final_rec["params"]["reduceOnly"], True)
+        self.assertNotIn("reduceOnly", final_rec["params"],
+                         "hedge close must NOT carry reduceOnly (DEV-01)")
         for rec in self.fx.created:
             self.assertNotEqual(rec["params"].get("positionSide"), "BOTH")
 
@@ -431,10 +433,10 @@ class CloseAfterRecoveryTest(TimeoutRecoveryBase):
         remaining = FakeVenue.position(side="short", contracts=0.1, entry=99.0,
                                        pid="pos-short")
         with self._patch_close(remaining):
-            engine.close_partial(0.5)               # BUY + reduceOnly + SHORT
+            engine.close_partial(0.5)               # BUY + hedge SHORT (no reduceOnly)
         engine.STATE["remaining_qty"] = 0.1
         with self._patch_close(None):
-            engine.close_position_full()            # BUY + reduceOnly + SHORT
+            engine.close_position_full()            # BUY + hedge SHORT (no reduceOnly)
 
         self.assertEqual(len(self.fx.created), 3)
         open_rec, partial_rec, final_rec = self.fx.created
@@ -443,10 +445,12 @@ class CloseAfterRecoveryTest(TimeoutRecoveryBase):
         self.assertNotIn("reduceOnly", open_rec["params"])
         self.assertEqual(partial_rec["side"], "buy")
         self.assertEqual(partial_rec["params"]["positionSide"], "SHORT")
-        self.assertEqual(partial_rec["params"]["reduceOnly"], True)
+        self.assertNotIn("reduceOnly", partial_rec["params"],
+                         "hedge close must NOT carry reduceOnly (DEV-01)")
         self.assertEqual(final_rec["side"], "buy")
         self.assertEqual(final_rec["params"]["positionSide"], "SHORT")
-        self.assertEqual(final_rec["params"]["reduceOnly"], True)
+        self.assertNotIn("reduceOnly", final_rec["params"],
+                         "hedge close must NOT carry reduceOnly (DEV-01)")
         for rec in self.fx.created:
             self.assertNotEqual(rec["params"].get("positionSide"), "BOTH")
 

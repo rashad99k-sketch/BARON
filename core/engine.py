@@ -3560,7 +3560,7 @@ def close_partial(ratio):
         side = "sell" if STATE["side"] == "BUY" else "buy"
         sym = normalize_symbol(symbol)
         qty_precise = float(ex.amount_to_precision(sym, qty_to_close))
-        order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"reduceOnly": True, "positionSide": _hedge_position_side(STATE["side"])})
+        order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"positionSide": _hedge_position_side(STATE["side"])})
         if order is None:
             log_execution("[CLOSE_PARTIAL] Order creation failed (None)", "ERROR")
             return False
@@ -3660,7 +3660,7 @@ def close_position_full():
         qty_precise = float(ex.amount_to_precision(sym, qty_to_close))
 
         for attempt in range(3):
-            order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"reduceOnly": True, "positionSide": _hedge_position_side(STATE["side"])})
+            order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"positionSide": _hedge_position_side(STATE["side"])})
             if order is None:
                 log_execution(f"[CLOSE] Order creation failed (attempt {attempt+1})", "ERROR")
                 time.sleep(1)
@@ -3703,7 +3703,7 @@ def close_position_full():
 
         log_execution("[CLOSE] All close attempts failed. Attempting emergency close via position close.", "ERROR")
         try:
-            order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"reduceOnly": True, "positionSide": _hedge_position_side(STATE["side"])})
+            order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"positionSide": _hedge_position_side(STATE["side"])})
             if order:
                 time.sleep(2)
                 pos = fetch_position(symbol)
@@ -6720,7 +6720,7 @@ def place_native_sl(symbol=None):
         order = safe_api_call(
             ex.create_order, sym, "STOP_MARKET", order_side,
             float(ex.amount_to_precision(sym, qty)),
-            params={"stopPrice": sl_price, "reduceOnly": True,
+            params={"stopPrice": sl_price,
                     "positionSide": _hedge_position_side(side)},
         )
         if order is None or not order.get("id"):
@@ -7234,7 +7234,7 @@ def close_position(amount, symbol):
     close_side = "sell" if side == "BUY" else "buy"
     try:
         amount = float(ex.amount_to_precision(sym, amount))
-        order = safe_api_call(ex.create_order, sym, "market", close_side, amount, params={"reduceOnly": True, "positionSide": _hedge_position_side(side)})
+        order = safe_api_call(ex.create_order, sym, "market", close_side, amount, params={"positionSide": _hedge_position_side(side)})
         with _TRADE_LOCK:
             _ACTIVE_TRADE = False
         log_execution(f"[CLOSE] Closed {amount} {symbol} (reduceOnly)", "SUCCESS")

@@ -1,10 +1,11 @@
 """Isolated regression suite for the BingX Hedge-Mode PositionSide fix.
 
 These tests exercise the REAL production order-submission layer
-(OrderManager.submit_order -> exchange.create_order) and the REAL reduceOnly
-close functions (close_partial / close_position_full / close_position) with
+(OrderManager.submit_order -> exchange.create_order) and the REAL hedge close
+functions (close_partial / close_position_full / close_position) with
 PAPER_MODE=False and a deterministic fake exchange that records the exact
-params sent to create_order.
+params sent to create_order.  In Hedge Mode the close orders must NOT send
+reduceOnly (BingX Docs-v3 forbid it) while keeping positionSide LONG/SHORT.
 
 All six-position portfolio caps / NEWS slot / coexistence are validated by the
 existing PAPER-mode harness (tests/test_portfolio_full_cycle.py and
@@ -162,7 +163,8 @@ class LiveOrderLayerLifecycleTest(unittest.TestCase):
         partial = self.fx.created[1]
         self.assertEqual(partial["side"], "sell")
         self.assertEqual(partial["params"]["positionSide"], "LONG")
-        self.assertEqual(partial["params"]["reduceOnly"], True)
+        self.assertNotIn("reduceOnly", partial["params"],
+                         "hedge partial close must NOT carry reduceOnly (DEV-01)")
 
         self.pos_return = None             # position gone -> FINAL CLOSE
         _state("BUY", qty=0.05)
@@ -170,7 +172,8 @@ class LiveOrderLayerLifecycleTest(unittest.TestCase):
         final = self.fx.created[2]
         self.assertEqual(final["side"], "sell")
         self.assertEqual(final["params"]["positionSide"], "LONG")
-        self.assertEqual(final["params"]["reduceOnly"], True)
+        self.assertNotIn("reduceOnly", final["params"],
+                         "hedge full close must NOT carry reduceOnly (DEV-01)")
 
         self.assertFalse(engine.STATE["open"])   # CLOSED
 
@@ -188,7 +191,8 @@ class LiveOrderLayerLifecycleTest(unittest.TestCase):
         partial = self.fx.created[1]
         self.assertEqual(partial["side"], "buy")
         self.assertEqual(partial["params"]["positionSide"], "SHORT")
-        self.assertEqual(partial["params"]["reduceOnly"], True)
+        self.assertNotIn("reduceOnly", partial["params"],
+                         "hedge partial close must NOT carry reduceOnly (DEV-01)")
 
         self.pos_return = None             # position gone -> FINAL CLOSE
         _state("SELL", qty=0.05)
@@ -196,7 +200,8 @@ class LiveOrderLayerLifecycleTest(unittest.TestCase):
         final = self.fx.created[2]
         self.assertEqual(final["side"], "buy")
         self.assertEqual(final["params"]["positionSide"], "SHORT")
-        self.assertEqual(final["params"]["reduceOnly"], True)
+        self.assertNotIn("reduceOnly", final["params"],
+                         "hedge full close must NOT carry reduceOnly (DEV-01)")
 
         self.assertFalse(engine.STATE["open"])   # CLOSED
 
@@ -226,15 +231,18 @@ class LiveOrderLayerLifecycleTest(unittest.TestCase):
                 self.assertLessEqual(len(cid), 40)
                 self.assertRegex(cid, FakeExchange.SAFE_CID)
 
-    # ---- partial-fill scenario: correct reduceOnly + PositionSide, never BOTH ----
+    # ---- partial-fill scenario: correct PositionSide (never BOTH), and hedge
+    #      closes never send reduceOnly ----
     def test_partial_fill_never_sends_both(self):
         self.pos_return = {"contracts": 0.05, "side": "long"}  # remaining position
         _state("BUY", qty=0.1)
         engine.close_partial(0.5)
         for rec in self.fx.created:
             self.assertNotEqual(rec["params"].get("positionSide"), "BOTH")
-            if rec["params"].get("reduceOnly") is True:
-                self.assertIn(rec["params"]["positionSide"], ("LONG", "SHORT"))
+            self.assertIn(rec["params"].get("positionSide"), ("LONG", "SHORT"),
+                          "hedge close must keep LONG/SHORT")
+            self.assertNotIn("reduceOnly", rec["params"],
+                             "hedge closes must never send reduceOnly (DEV-01)")
 
     # ---- reconciliation boundary never generates BOTH, for both LONG and SHORT ----
     def test_reconciliation_boundary_no_both(self):
