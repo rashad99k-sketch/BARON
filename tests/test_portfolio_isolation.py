@@ -140,8 +140,8 @@ class PortfolioSixPositionTest(unittest.TestCase):
     def tearDown(self):
         os.environ.clear()
 
-    def _cand(self, sym, cls, price):
-        return {"symbol": sym, "side": "BUY", "price": price, "sl": price * 0.98,
+    def _cand(self, sym, cls, price, side="BUY"):
+        return {"symbol": sym, "side": side, "price": price, "sl": price * 0.98,
                 "tp1": price * 1.03, "tp2": price * 1.06, "score": 85, "atr": price * 0.01,
                 "asset_class": cls, "trade_id": sym}
 
@@ -187,6 +187,54 @@ class PortfolioSixPositionTest(unittest.TestCase):
         # Manage all without crash; snapshot reflects open positions
         p.manage_all()
         self.assertEqual(len(p.snapshot()), p.count())
+
+    def test_max_crypto_positions_wins_over_master_override(self):
+        # A per-class env cap must take precedence over the EVERY-class master
+        # override, and the allocator (dashboard authority) must agree with the
+        # open authority (PortfolioManager._class_cap) on the SAME rule.
+        os.environ["MAX_CRYPTO_POSITIONS"] = "6"
+        os.environ["MAX_POSITIONS_PER_ASSET_CLASS"] = "1"
+        e = PaperMarginEngine()
+        p = PortfolioManager(6, e)
+        p.bind(e)
+
+        five = [
+            self._cand("BTC/USDT:USDT", "CRYPTO", 60000.0),
+            self._cand("ETH/USDT:USDT", "CRYPTO", 3000.0, side="SELL"),
+            self._cand("SOL/USDT:USDT", "CRYPTO", 150.0),
+            self._cand("BNB/USDT:USDT", "CRYPTO", 600.0, side="SELL"),
+            self._cand("XRP/USDT:USDT", "CRYPTO", 2.0),
+        ]
+        self.assertEqual(p.open_top(five, slots=5), 5)
+
+        # The 6th CRYPTO slot comes from the per-class override (5 < 6), even
+        # though the master override only allows 1 position per class.
+        self.assertTrue(p.can_open("WLD/USDT:USDT", "CRYPTO"))
+        # Different classes are still governed by the master override -> cap 1.
+        self.assertTrue(p.can_open("US500/USDT:USDT", "INDEX"))
+        self.assertTrue(p.can_open("XAUUSD", "GOLD"))
+
+        self.assertEqual(
+            p.open_top([self._cand("WLD/USDT:USDT", "CRYPTO", 15.0, side="SELL")],
+                       slots=1), 1)
+        self.assertEqual(p.count(), 6)
+
+        from portfolio.allocator import GlobalAssetAllocator, class_cap_from_env
+        self.assertEqual(class_cap_from_env("CRYPTO"), 6)
+        self.assertEqual(class_cap_from_env("INDEX"), 1)
+        self.assertEqual(class_cap_from_env("GOLD"), 1)
+
+        # A 7th CRYPTO candidate is denied by the GLOBAL cap (limit 6), NOT by
+        # the class cap — proving the per-class override is what granted the
+        # sixth seat.
+        alloc = GlobalAssetAllocator(p, e)
+        report = alloc.allocate(
+            [{"symbol": "ADA/USDT:USDT", "side": "SELL",
+              "asset_class": "CRYPTO", "priority_score": 85.0}],
+            limit=6,
+        )
+        self.assertFalse(report.decisions[0].allowed)
+        self.assertIn(report.decisions[0].reason, ("SLOT_CAP", "CRYPTO_CAP"))
 
         # Closing frees a slot
         first = p.symbols()[0]

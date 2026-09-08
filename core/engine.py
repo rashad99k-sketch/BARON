@@ -557,7 +557,9 @@ INSUFFICIENT_MARGIN_COOLDOWN_SEC = 60
 #     engine enforces it against the actual committed_margin ledger before any
 #     new commit, so a 7th direct entry is blocked even outside the manager.
 #   * MAX_OPEN_POSITIONS: global cap on simultaneous open positions (6-slot
-#     technical model: 2 CRYPTO / 2 INDEX / 1 GOLD / 1 OIL + independent NEWS).
+#     technical model: 2 CRYPTO / 2 INDEX / 1 GOLD / 1 OIL + independent NEWS;
+#     per-class caps are tunable via MAX_<CLASS>_POSITIONS / the master
+#     MAX_POSITIONS_PER_ASSET_CLASS override — see allocator.class_cap_from_env).
 POSITION_MARGIN_PCT = float(os.getenv("POSITION_MARGIN_PCT", "0.10"))
 PORTFOLIO_MARGIN_CAP_PCT = float(os.getenv("PORTFOLIO_MARGIN_CAP_PCT", "0.60"))
 MAX_OPEN_POSITIONS = max(1, int(os.getenv("MAX_OPEN_POSITIONS", "6")))

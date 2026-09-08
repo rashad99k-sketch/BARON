@@ -298,6 +298,19 @@ class AllocatorGatesOnLivePortfolioTest(_PortfolioEngineTestCase):
     """GlobalAssetAllocator must explain every unused slot while six positions
     are live: class caps, directional caps and slot cap all stay engaged."""
 
+    def setUp(self):
+        # This class pins the TRUE 6-market default profile (2 CRYPTO / 2 INDEX
+        # / 1 GOLD / 1 OIL), so the EVERY-class master override is suspended
+        # here. The lifecycle classes above deliberately keep it (they also
+        # rely on it to grant AAPL/STOCK a rotation seat).
+        super().setUp()
+        self._master_override = os.environ.pop("MAX_POSITIONS_PER_ASSET_CLASS", None)
+
+    def tearDown(self):
+        if self._master_override is not None:
+            os.environ["MAX_POSITIONS_PER_ASSET_CLASS"] = self._master_override
+        super().tearDown()
+
     def _open_six(self):
         # 3 BUY + 3 SELL so the directional cap (4) does not mask class caps.
         six = [

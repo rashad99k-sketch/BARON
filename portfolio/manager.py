@@ -94,19 +94,16 @@ class PortfolioManager:
     def _class_cap(cls: str) -> int:
         """Per-class slot capacity for the 6-market model.
 
-        Source of truth is portfolio.allocator.DEFAULT_CLASS_CAPS, so the
-        allocator report and the open authority always agree:
-        CRYPTO:2 / INDEX:2 / GOLD:1 / OIL:1, plus the independent NEWS:1 slot.
-        Classes outside the market model (STOCK, ...) get cap 0 -- discovered
-        but never opened as a portfolio slot.
-        The env master override MAX_POSITIONS_PER_ASSET_CLASS applies to EVERY
-        class when explicitly set only (no 999 fake default).
+        Source of truth is portfolio.allocator (DEFAULT_CLASS_CAPS + the live
+        env overrides MAX_<CLASS>_POSITIONS / MAX_POSITIONS_PER_ASSET_CLASS),
+        so the allocator report and the open authority always agree:
+        CRYPTO:2 / INDEX:2 / GOLD:1 / OIL:1 by default, plus the independent
+        NEWS:1 slot. Classes outside the market model (STOCK, ...) get cap 0 --
+        discovered but never opened as a portfolio slot. Every cap can be tuned
+        per class through the environment without code changes.
         """
-        env = os.getenv("MAX_POSITIONS_PER_ASSET_CLASS", "").strip()
-        if env:
-            return max(1, int(env))
-        from portfolio.allocator import DEFAULT_CLASS_CAPS
-        return int(DEFAULT_CLASS_CAPS.get(str(cls).upper(), 0))
+        from portfolio.allocator import class_cap_from_env
+        return class_cap_from_env(str(cls).upper())
 
     def _ctx_class(self, pos) -> str:
         """Class of an open context: prefer the EXPLICIT class stored at OPEN

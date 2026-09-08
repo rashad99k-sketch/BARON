@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
+import os
 import threading
 import time
 
@@ -38,6 +39,35 @@ DEFAULT_CLASS_CAPS = {
     "OIL": 1,
     "NEWS": 1,
 }
+
+
+def class_cap_from_env(cls: str, default: Optional[int] = None) -> int:
+    """Effective per-class capacity after environment overrides (ONE rule).
+
+    Precedence: ``MAX_<CLASS>_POSITIONS`` (per class) >
+    ``MAX_POSITIONS_PER_ASSET_CLASS`` (applied to EVERY class) >
+    ``DEFAULT_CLASS_CAPS`` / the provided default.
+
+    The dashboard, the open authority (``PortfolioManager._class_cap``) and the
+    allocator all read this single rule, so reports and real opens always agree —
+    even when the environment is tuned at runtime (tests configure it per-case).
+    """
+    name = str(cls).strip().upper()
+    specific = os.getenv(f"MAX_{name}_POSITIONS", "").strip()
+    if specific:
+        return max(1, int(specific))
+    master = os.getenv("MAX_POSITIONS_PER_ASSET_CLASS", "").strip()
+    if master:
+        return max(1, int(master))
+    if default is not None:
+        return int(default)
+    return int(DEFAULT_CLASS_CAPS.get(name, 0))
+
+
+def effective_class_caps() -> Dict[str, int]:
+    """Live snapshot of the per-class caps honoring the env overrides."""
+    return {cls: class_cap_from_env(cls, default)
+            for cls, default in DEFAULT_CLASS_CAPS.items()}
 
 
 @dataclass
@@ -118,6 +148,7 @@ class GlobalAssetAllocator:
                 direction_bias[side] = direction_bias.get(side, 0) + 1
 
             chosen = 0
+            caps = effective_class_caps()
             for cand in list_cands:
                 sym = str(cand.get("symbol", ""))
                 side = str(cand.get("side", "")).upper()
@@ -128,7 +159,7 @@ class GlobalAssetAllocator:
                 if len(decisions) + current >= limit:
                     allowed = False
                     reason = "SLOT_CAP"
-                class_cap = self.CLASS_CAPS.get(cls, 0)
+                class_cap = caps.get(cls, 0)
                 side_cap = self.SIDE_CAPS.get(side, 0)
                 if class_bias.get(cls, 0) >= class_cap:
                     allowed = False
@@ -157,7 +188,7 @@ class GlobalAssetAllocator:
                 slot_reason = "OK"
             max_class = max(class_bias.values()) if class_bias else 0
             concentration = (
-                "HIGH" if class_bias and max_class >= max(self.CLASS_CAPS.get(c, 6) for c in class_bias)
+                "HIGH" if class_bias and max_class >= max(caps.get(c, 6) for c in class_bias)
                 else ("MEDIUM" if max_class >= 2 else "LOW"))
             return PortfolioAllocationReport(
                 decisions=decisions, class_bias=class_bias, direction_bias=direction_bias,

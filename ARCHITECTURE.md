@@ -33,8 +33,23 @@ in `news/service.py`, and order execution remains in the preserved BingX kernel.
 
 `MAX_OPEN_POSITIONS=6` is a capacity limit. The allocator does not force six
 trades. It first attempts to take the best candidate from each asset class,
-then fills remaining slots by score, subject to
-`MAX_POSITIONS_PER_ASSET_CLASS` and the existing margin cap.
+then fills remaining slots by score, subject to the per-class cap and the
+existing margin cap.
+
+Per-class caps come from a single live rule shared by the open authority
+(`PortfolioManager._class_cap`) and the allocator report
+(`GlobalAssetAllocator.allocate`), in this precedence:
+
+1. `MAX_<CLASS>_POSITIONS` (e.g. `MAX_CRYPTO_POSITIONS`) — per-class override;
+2. `MAX_POSITIONS_PER_ASSET_CLASS` — the EVERY-class master override;
+3. the built-in 6-market default profile: CRYPTO 2 / INDEX 2 / GOLD 1 / OIL 1 /
+   NEWS 1 (unknown classes cap at 0, so e.g. STOCK never opens by default).
+
+Example: running with `MAX_CRYPTO_POSITIONS=6` and a crypto-heavy live board
+expands the CRYPTO seat count to 6 while INDEX/GOLD/OIL keep their defaults.
+The default profile explains why a crypto-heavy board historically opened only
+2 of 6 slots — that was the CRYPTO cap being enforced correctly, not a broken
+open path.
 
 ## Market support
 
