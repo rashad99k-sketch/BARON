@@ -40,10 +40,17 @@ class PortfolioRiskGuard:
     def _equity(self) -> float:
         try:
             if self.engine is not None:
+                getter = getattr(self.engine, "get_equity_safe", None)
+                if callable(getter):
+                    # Coherent equity in ONE snapshot (free + committed
+                    # together). Pairing a cached free balance with a live
+                    # committed value is incoherent whenever margin moved
+                    # inside the cache window and produces a false
+                    # daily-drawdown (see engine.get_equity_safe).
+                    return max(0.0, float(getter()))
+                # Fallback for test fakes / engines without get_equity_safe.
                 bal = max(0.0, float(self.engine.get_balance_safe()))
-                # Committed margin is part of total equity, NOT a loss. Account
-                # for it so that opening positions (which moves free balance
-                # into committed margin) does not register as a daily drawdown.
+                # Committed margin is part of total equity, NOT a loss.
                 paper = getattr(self.engine, "paper", None)
                 if isinstance(paper, dict):
                     bal += max(0.0, float(paper.get("committed_margin", 0.0)))

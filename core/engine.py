@@ -796,6 +796,32 @@ def get_free_balance_safe():
     cache_set("free_balance", bal)
     return bal
 
+def get_equity_safe(ttl: int = 10):
+    """Coherent account equity (free + committed margin in ONE snapshot).
+
+    ``get_balance_safe`` alone returns only the free balance and caches it for
+    the TTL window; a caller that pairs that stale snapshot with a *current*
+    ``committed_margin`` reads an incoherent total whenever margin transfers
+    happened inside the window (a cached free balance lacks this period's
+    committed margin). Equity is what risk/allocator gates must judge, so it is
+    captured here as a single timestamped value: free + committed in PAPER mode,
+    the exchange's own ``total`` equity in LIVE mode.
+    """
+    cached = cache_get("equity", ttl)
+    if cached is not None:
+        return float(cached)
+    if PAPER_MODE:
+        equity = max(0.0, float(paper.get("balance", 0.0) or 0.0)
+                     + float(paper.get("committed_margin", 0.0) or 0.0))
+    else:
+        bal = safe_api_call(ex.fetch_balance)
+        if bal:
+            equity = max(0.0, float(bal.get("total", {}).get("USDT", 0.0) or 0.0))
+        else:
+            equity = max(0.0, float(get_balance() or 0.0))
+    cache_set("equity", equity)
+    return equity
+
 def get_orderbook_cached(symbol, limit=20):
     if STATE.get("open") or TRADE_STATE["in_position"]:
         cached = cache_get("orderbook", 60, f"{symbol}_{limit}")

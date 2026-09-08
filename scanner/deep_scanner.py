@@ -1181,12 +1181,18 @@ class DeepScanner:
             # represents as INSTITUTIONAL ZONE ANALYSIS — Dynamic Candidates.
             # It runs on the same fresh Watchlist result, so there is no extra
             # 90-second radar wait and no dependency on the old main_loop_sniper.
+            # Every MEDIUM/STRONG deep-analyzed symbol is routed to the
+            # institutional resolver WITHOUT waiting for precursor evidence:
+            # the resolver's own quality gates (institutional precursor keys,
+            # hypothesis, phase, state) decide whether the symbol actually
+            # enters the registry. This makes the MEDIUM -> INSTITUTIONAL hop
+            # latency-free instead of gated on opinion accumulation.
             try:
                 radar = getattr(self, "_institutional_radar", None)
                 if radar is None and hasattr(E, "InstitutionalRadar"):
                     radar = E.InstitutionalRadar()
                     self._institutional_radar = radar
-                if radar is not None and entry.get("pre_expansion_state") and len(precursor_evidence) >= 1:
+                if radar is not None and str(entry.get("strength", "WEAK")).upper() in ("MEDIUM", "STRONG"):
                     radar._update_a_grade_status(entry)
                     radar._sync_institutional_zone_registry(sym, entry)
                     if entry.get("institutional_zone_active"):
@@ -1245,6 +1251,16 @@ class DeepScanner:
                 watch[sym] = result
                 updated.append(result)
 
+        # MEDIUM-free-latency hand-off: every MEDIUM/STRONG symbol that has
+        # already been deep-analyzed ANYWHERE in the active watchlist is routed
+        # to Institutional Zone Analysis in the SAME scanner cycle. A symbol
+        # must NOT wait for its own rotating deep-batch turn (batch_size
+        # symbols per tick over potentially hundreds of watchlist entries).
+        swept = self._fast_institutional_sweep(watch)
+        self.stats["institutional_sweep_promoted"] = (
+            self.stats.get("institutional_sweep_promoted", 0) + swept
+        )
+
         # Keep the watchlist dynamic: stale entries are removed only after they
         # have been rechecked, while the next global cycle can replace them.
         self.stats["deep_analyzed"] = self.stats.get("deep_analyzed", 0) + len(updated)
@@ -1270,6 +1286,58 @@ class DeepScanner:
         E.MEMORY["deep_scanner"] = ranked[: self.watchlist_limit]
         self.last_watch_update = now
         return updated
+
+    def _fast_institutional_sweep(self, watch: dict) -> int:
+        """Route every MEDIUM/STRONG deep-analyzed watchlist entry to the
+        Institutional Zone Analysis resolver immediately, regardless of which
+        rotating batch (or lack of it) produced the entry.
+
+        This is the latency-free path for MEDIUM assets: the moment a symbol is
+        deep-analyzed with MEDIUM (or STRONG) strength it is handed to the
+        institutional resolver in the same scanner cycle — without waiting for
+        its own turn in the rotating ``watch_batch`` and without waiting for
+        incremental precursor-evidence growth. The resolver's own gates
+        (institutional precursor keys, hypothesis, phase, state) still decide
+        whether the symbol qualifies for the registry. Analysis-only; it can
+        never create an execution order.
+        """
+        radar = getattr(self, "_institutional_radar", None)
+        if radar is None and hasattr(E, "InstitutionalRadar"):
+            try:
+                radar = E.InstitutionalRadar()
+            except Exception:
+                radar = None
+            self._institutional_radar = radar
+        if radar is None:
+            return 0
+        promoted = 0
+        for sym, entry in watch.items():
+            if not isinstance(entry, dict) or not entry.get("deep_analyzed"):
+                continue
+            if str(entry.get("strength", "WEAK")).upper() not in ("MEDIUM", "STRONG"):
+                continue
+            if entry.get("institutional_zone_active"):
+                continue
+            try:
+                radar._update_a_grade_status(entry)
+                radar._sync_institutional_zone_registry(sym, entry)
+            except Exception as exc:
+                self.stats["errors"] += 1
+                E.log_execution(
+                    f"[PROMOTION] {sym} fast institutional sweep failed: {exc}",
+                    "WARN",
+                    debounce_key=f"inst_sweep_error_{sym}", debounce_sec=120,
+                )
+                continue
+            if entry.get("institutional_zone_active"):
+                promoted += 1
+                E.log_execution(
+                    f"[PROMOTION] {sym} {entry.get('strength')} swept -> "
+                    f"INSTITUTIONAL_ZONE_ANALYSIS",
+                    "SUCCESS",
+                    debounce_key=f"inst_sweep_{sym}", debounce_sec=30,
+                )
+        return promoted
 
     def top(self, limit: int = 6) -> List[dict]:
         self.monitor_watchlist(force=True)

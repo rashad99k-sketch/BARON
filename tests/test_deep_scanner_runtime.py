@@ -242,6 +242,79 @@ class DeepScannerRuntimeTest(unittest.TestCase):
         self.assertIn("BTC/USDT:USDT", E.MEMORY["institutional_zone_analysis"])
         self.assertFalse(row.get("institutional_prepared", False))
 
+    def test_medium_in_watchlist_swept_to_institutional_without_batch_turn(self):
+        # A MEDIUM symbol that is deep-analyzed but NOT part of this cycle's
+        # rotating batch must still reach Institutional Zone Analysis in the
+        # same monitor tick: zero wait for its batch turn.
+        E = sys.modules["core.engine"]
+        scanner = self.DeepScanner(max_symbols=4)
+        sym = "ETH/USDT:USDT"
+        entry = {
+            "symbol": sym, "asset_class": "CRYPTO", "score": 6.0,
+            "strength": "MEDIUM", "deep_analyzed": True, "side": "SELL",
+            "price": 3000.0, "state": "REJECTION",
+            "pre_expansion_state": "PRE_EXPANSION_SHORT",
+            "pre_expansion_evidence": ["BOS", "REJECTION"],
+            "institutional_precursor_evidence": ["BOS", "REJECTION"],
+            "pre_expansion": {"phase": "EARLY_EXPANSION",
+                              "indicator_alignment": "BEARISH"},
+            "last_update": 0.0,
+        }
+        E.MEMORY["watchlist"] = {sym: entry}
+        E.MEMORY["institutional_zone_analysis"] = {}
+        # No batch entries at all -> nothing is re-analyzed this cycle.
+        scanner.watch_batch_size = 0
+        updated = scanner.monitor_watchlist(force=True)
+        self.assertEqual(len(updated), 0, "no symbol was deep-re-analyzed this tick")
+        self.assertEqual(E.MEMORY["watchlist_deep_analyzed"], 0)
+        # Yet the MEDIUM symbol is in Institutional Zone Analysis immediately.
+        self.assertTrue(entry.get("institutional_zone_active"))
+        self.assertIn(sym, E.MEMORY["institutional_zone_analysis"])
+        self.assertEqual(E.MEMORY["institutional_zone_count"], 1)
+
+    def test_zero_evidence_medium_still_routed_to_institutional_resolver(self):
+        # MEDIUM without institutional precursor evidence is STILL handed to
+        # the institutional resolver in the same tick (latency-free routing);
+        # the resolver's quality gate keeps it out of the registry.
+        E = sys.modules["core.engine"]
+
+        class SpyRadar:
+            def __init__(self):
+                self.synced = []
+
+            def _update_a_grade_status(self, entry):
+                entry["a_grade_ready"] = False
+                entry["a_grade_reasons"] = []
+
+            def _sync_institutional_zone_registry(self, symbol, entry):
+                self.synced.append(symbol)
+                registry = E.MEMORY.setdefault("institutional_zone_analysis", {})
+                if entry.get("pre_expansion_state") and entry.get("institutional_precursor_evidence"):
+                    registry[symbol] = {"symbol": symbol, "strength": entry.get("strength")}
+                else:
+                    registry.pop(symbol, None)
+                entry["institutional_zone_active"] = bool(registry.get(symbol))
+                E.MEMORY["institutional_zone_count"] = len(registry)
+
+        E.InstitutionalRadar = SpyRadar
+        scanner = self.DeepScanner(max_symbols=4)
+        sym = "WTI/USDT:USDT"
+        entry = {
+            "symbol": sym, "asset_class": "OIL", "score": 5.5,
+            "strength": "MEDIUM", "deep_analyzed": True, "side": "BUY",
+            "price": 100.0, "state": "DETECTED", "last_update": 0.0,
+        }
+        E.MEMORY["watchlist"] = {sym: entry}
+        E.MEMORY["institutional_zone_analysis"] = {}
+        scanner.watch_batch_size = 0
+        scanner.monitor_watchlist(force=True)
+        spy = scanner._institutional_radar
+        self.assertIsInstance(spy, SpyRadar)
+        self.assertIn(sym, spy.synced, "MEDIUM was routed to the resolver this tick")
+        self.assertFalse(entry.get("institutional_zone_active"),
+                         "quality gate: zero-evidence MEDIUM stays out of the registry")
+        self.assertEqual(E.MEMORY["institutional_zone_count"], 0)
+
 
 class OrderbookSideBoostRuntimeTest(unittest.TestCase):
     """End-to-end proof that the deep scanner reads the orderbook sides.
