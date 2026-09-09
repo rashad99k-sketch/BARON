@@ -311,7 +311,11 @@ class ForensicFixesTest(unittest.TestCase):
         q.add_candidate(cand)
         # The slow path preconditions (zone proximity inside _check_entry_conditions)
         # are data-dependent; stub them so the fast-path READY branch is isolated.
-        q._check_entry_conditions = lambda d, s, a, sy="": True
+        def _check_stub(d, s, a, sy="", reason_out=None):
+            if reason_out is not None:
+                reason_out["blocker"] = "stub_pass"
+            return True
+        q._check_entry_conditions = _check_stub
         q.re_evaluate_all(lambda sym: _bearing_df())
         self.assertEqual(cand.state, E.ExecutionState.READY)
         self.assertEqual(cand.ready_blocker, "NONE")

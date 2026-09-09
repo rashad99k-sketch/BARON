@@ -566,6 +566,18 @@ class PaperCloseSemanticsTest(unittest.TestCase):
         E.log_execution = self._orig_log
         E.get_ticker_safe = self._orig_ticker
         E.finalize_trade_with_reality = self._orig_finalize
+        # Test-only state isolation: seed()-style tests leave E.STATE open/closed
+        # artifacts with 'current_symbol' / 'remaining_qty' set. If they leak,
+        # later test modules that share the module-global STATE (e.g.
+        # test_paper_audit_runtime) observe a stale 'open' flag. Reset the full
+        # shared state after every test so nothing leaks across files.
+        E.STATE.clear()
+        E.TRADE_STATE.clear()
+        E.DASHBOARD_STATE.clear()
+        E.DASHBOARD_STATE["logs"] = []
+        E.paper.update({"balance": 10000.0, "position": None, "committed_margin": 0.0})
+        E._closing_in_progress = False
+        E._reconciliation_pending = False
 
     def _seed(self, side, qty=1.0, entry=60000.0):
         E.STATE.update({

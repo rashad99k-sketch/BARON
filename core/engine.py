@@ -14343,10 +14343,12 @@ class ExecutionQueue:
             return
         with self._lock:
             for symbol, cand in list(self._candidates.items()):
-                if (cand.institutional_score >= 70 and
-                    cand.pre_institutional_state in ("CONFIRMED", "PRE_ENTRY_READY")):
-                    df = data_fetcher(symbol)
-                    if df is not None and self._check_entry_conditions(df, cand.side, cand.atr, symbol):
+                fast_eligible = (cand.institutional_score >= 70 and
+                                 cand.pre_institutional_state in ("CONFIRMED", "PRE_ENTRY_READY"))
+                df = data_fetcher(symbol)
+                if fast_eligible:
+                    fast_reason = {}
+                    if df is not None and self._check_entry_conditions(df, cand.side, cand.atr, symbol, reason_out=fast_reason):
                         if not cand.ready_time:
                             cand.ready_time = time.time()
                         cand.state = ExecutionState.READY
@@ -14354,10 +14356,19 @@ class ExecutionQueue:
                         cand.confirmation_state = "CONFIRMED_2"
                         cand.confirmation_reason = "CONFIRMATION_COMPLETE"
                         log_execution(f"[QUEUE] {symbol} confirmed READY with Institutional Context", "SUCCESS")
-                    else:
-                        cand.state = ExecutionState.WAITING_TRIGGER
-                    continue
-                df = data_fetcher(symbol)
+                        continue
+                    # Fast live-snapshot gate FAILED for an institutional candidate.
+                    # This is NOT an automatic WAITING_TRIGGER: record the exact
+                    # snapshot blocker and fall through into the FULL deep
+                    # re-evaluation below so READY is still decided by the complete
+                    # confirmation/trigger/evidence/score gates. The fast gate stays
+                    # a pure safety gate: it can promote to READY, it can never
+                    # demote or strand a candidate (forensic BUG#2 fix).
+                    cand.evidence = dict(cand.evidence or {})
+                    cand.evidence["fast_gate_blocker"] = fast_reason.get("blocker", "fast_gate_unknown")
+                    cand.evidence["fast_gate_failed_at"] = time.time()
+                    record_gate_event(symbol, "QUEUE", "FAST_GATE_FAIL",
+                                      cand.evidence["fast_gate_blocker"], cand.side)
                 if not is_valid_dataframe(df, required_cols=['timestamp','open','high','low','close','volume']) or len(df) < 30:
                     self.gate_stats["insufficient_data"] += 1
                     record_gate_event(symbol, "QUEUE", "INSUFFICIENT_DATA",
@@ -15758,8 +15769,10 @@ class ExecutionQueue:
             return False
         return True
 
-    def _check_entry_conditions(self, df, side, atr, symbol=""):
+    def _check_entry_conditions(self, df, side, atr, symbol="", reason_out=None):
         if df is None or len(df) < 20:
+            if reason_out is not None:
+                reason_out["blocker"] = "insufficient_data"
             return False
         adx = compute_adx(df).iloc[-1] if len(df) >= 20 else 0
         # Use the SAME class-aware ADX band as the queue READY decision and the
@@ -15768,19 +15781,29 @@ class ExecutionQueue:
         ac = AssetBehaviorProfile.entry_config(
             AssetBehaviorProfile.resolve_asset_class(str(symbol or "")))
         if not (float(ac["min_adx"]) <= adx <= float(ac["max_adx"])):
+            if reason_out is not None:
+                reason_out["blocker"] = f"adx_out_of_band(adx={adx:.1f}, band=[{ac['min_adx']},{ac['max_adx']}])"
             return False
         vol_state = classify_volume(df)
         if vol_state not in ("expansion", "spike", "normal"):
+            if reason_out is not None:
+                reason_out["blocker"] = f"volume_{vol_state}"
             return False
         price = df['close'].iloc[-1]
-        zones = get_smart_zones("", df)
+        # Pass the REAL symbol so get_smart_zones() caches under the per-symbol
+        # key and never contaminates other candidates' zones (forensic BUG#1).
+        zones = get_smart_zones(str(symbol or ""), df)
         if side == "BUY" and zones.get("buy_zones"):
             zone_price = zones["buy_zones"][0]["price"]
             if abs(price - zone_price) / price > 0.005:
+                if reason_out is not None:
+                    reason_out["blocker"] = f"zone_proximity(dist={abs(price-zone_price)/price:.4f}>0.005)"
                 return False
         elif side == "SELL" and zones.get("sell_zones"):
             zone_price = zones["sell_zones"][0]["price"]
             if abs(price - zone_price) / price > 0.005:
+                if reason_out is not None:
+                    reason_out["blocker"] = f"zone_proximity(dist={abs(price-zone_price)/price:.4f}>0.005)"
                 return False
         return True
 
