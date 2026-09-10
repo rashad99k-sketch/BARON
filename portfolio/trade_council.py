@@ -109,6 +109,10 @@ class TradeCouncil:
             # Profit taking
             "tp1_partial_ratio": float(os.getenv("TP1_PARTIAL_RATIO", "0.5")),
             "tp2_full_close": os.getenv("TP2_FULL_CLOSE", "True").lower() in ("true", "1", "yes"),
+            # VPA profit defense: high-effort/law-result is NOT strength.
+            "vpa_bank_roi_pct": float(os.getenv("VPA_BANK_ROI_PCT", "18.0")),
+            "vpa_bank_ratio": float(os.getenv("VPA_BANK_RATIO", "0.4")),
+            "vpa_strict_roe_ceiling": float(os.getenv("VPA_STRICT_ROE_CEILING", "0.5")),
             "breakeven_roi_pct": float(os.getenv("BREAKEVEN_ROI_PCT", "0.2")),
             "profit_lock_roi_pct": float(os.getenv("PROFIT_LOCK_ROI_PCT", "0.5")),
             # Aggressive closing
@@ -156,6 +160,10 @@ class TradeCouncil:
             return self._attach_votes(decision, votes)
 
         decision = self._check_protection_update(market)
+        if decision:
+            return self._attach_votes(decision, votes)
+
+        decision = self._check_vpa_profit_defense(market)
         if decision:
             return self._attach_votes(decision, votes)
 
@@ -354,14 +362,47 @@ class TradeCouncil:
             "ScalpDesk", "scalp exits", "HOLD", 20,
             f"scalp open roe={trade.roe_pct:.2f}% hold={hold_sec:.0f}s")
 
+    def _member_volume_truth(self, market: MarketSnapshot) -> CouncilMemberVote:
+        """VolumeTruth — Effort-vs-Result lens: high effort with weak result is
+        absorption/distribution pressure, never strength; it votes to bank or
+        exit, never to add."""
+        trade = self.trade
+        eff = self._vpa_effort(market)
+        status = str(eff.get("status", "STALL"))
+        vr = float(eff.get("volume_ratio", 1.0))
+        if trade.trade_style == TradeStyle.SCALP:
+            return CouncilMemberVote("VolumeTruth", "effort/result", "HOLD", 15,
+                                     f"desk idle (non-directional scalp)")
+        if status == "WEAK_RESULT" and trade.roe_pct >= self._config["vpa_bank_roi_pct"]:
+            return CouncilMemberVote(
+                "VolumeTruth", "effort/result", "PARTIAL_CLOSE", 66,
+                f"high effort, stale result roe={trade.roe_pct:.1f}% vol={vr:.2f}x")
+        if status == "WEAK_RESULT" and trade.roe_pct <= self._config["vpa_strict_roe_ceiling"]:
+            opp = self._vpa_effort(market, opposing=True)
+            if opp.get("status") == "CONFIRMED":
+                return CouncilMemberVote(
+                    "VolumeTruth", "effort/result", "FULL_CLOSE", 89,
+                    f"opposing displacement confirmed roe={trade.roe_pct:.2f}%")
+            return CouncilMemberVote(
+                "VolumeTruth", "effort/result", "PARTIAL_CLOSE", 58,
+                f"eroding thesis on volume roe={trade.roe_pct:.2f}% vol={vr:.2f}x")
+        if status == "CONFIRMED" and abs(market.trend_strength) < 0.3:
+            return CouncilMemberVote(
+                "VolumeTruth", "effort/result", "HOLD", 40,
+                f"effort confirmed vol={vr:.2f}x")
+        return CouncilMemberVote(
+            "VolumeTruth", "effort/result", "HOLD", 22,
+            f"effort={status} vol={vr:.2f}x")
+
     def board_votes(self, market: MarketSnapshot) -> List[CouncilMemberVote]:
-        """Run all five named council members. Returns their verdicts."""
+        """Run all named council members. Returns their verdicts."""
         return [
             self._member_trend_rider(market),
             self._member_profit_guardian(market),
             self._member_risk_officer(market),
             self._member_thesis_officer(market),
             self._member_scalp_desk(market),
+            self._member_volume_truth(market),
         ]
 
     def _compute_unrealized(self, market: MarketSnapshot) -> None:
@@ -632,6 +673,94 @@ class TradeCouncil:
                     board_notes={"sl_hit": True, "sl": trade.synthetic_sl},
                 )
 
+        return None
+
+    def _vpa_effort(self, market: MarketSnapshot, opposing: bool = False) -> dict:
+        """Effort-vs-Result of the last bars for the thesis side (or its
+        opposite). Falls back to STALL when live OHLCV is unavailable."""
+        side = ("SELL" if self.trade.side == "BUY" else "BUY") if opposing else self.trade.side
+        df = getattr(market, "df", None)
+        if df is None or market.atr <= 0 or getattr(df, "empty", True):
+            return {"status": "STALL", "volume_ratio": 1.0}
+        try:
+            from core.vpa_volume import effort_result
+            eff = effort_result(df, side, market.atr, lookback=3) or {}
+            if not isinstance(eff, dict):
+                eff = {}
+            eff.setdefault("volume_ratio", 1.0)
+            return eff
+        except Exception:
+            return {"status": "STALL", "volume_ratio": 1.0}
+
+    def _check_vpa_profit_defense(self, market: MarketSnapshot) -> Optional[TradeDecision]:
+        """VPA steering — high effort with a weak result is NOT strength.
+
+        * Healthy trend (strong + adx) rides untouched (trend mgmt owns it).
+        * ROE >= VPA_BANK_ROI_PCT (+18% default) with WEAK_RESULT (effort without
+          result / distribution pressure): bank a partial PROFIT_PARTIAL, tighten
+          the lock (ratchet 50% of the run), then let protection trail. NOT an
+          instant full close.
+        * ROE already eroding (<= vpa_strict_roe_ceiling) while the OPPOSING side
+          shows CONFIRMED displacement + structure failure: institutional
+          reversal -> STRICT_CLOSE.
+        * ROE below the thesis threshold with adverse volume (>=1.5x): full close.
+        """
+        trade = self.trade
+        if trade.trade_style == TradeStyle.SCALP:
+            return None
+        c = self._config
+        if abs(market.trend_strength) >= 0.7 and market.adx >= c["trend_adx_min"]:
+            return None
+        eff = self._vpa_effort(market)
+        status = str(eff.get("status", "STALL"))
+        if status != "WEAK_RESULT":
+            return None
+        vr = float(eff.get("volume_ratio", 1.0))
+        if trade.roe_pct >= c["vpa_bank_roi_pct"] and trade.remaining_ratio > 0.3:
+            if trade.side == "BUY":
+                lock = trade.entry_price + (market.price - trade.entry_price) * 0.5
+            else:
+                lock = trade.entry_price - (trade.entry_price - market.price) * 0.5
+            if trade.ratchet_sl(lock):
+                if trade.protection_state not in (ProtectionState.PROFIT_LOCK, ProtectionState.TRAILING):
+                    trade.protection_state = ProtectionState.PROFIT_LOCK
+                if trade.profit_stage == ProfitStage.NONE or trade.profit_stage is None:
+                    trade.advance_stage(ProfitStage.TRAILING_ACTIVE)
+            return TradeDecision(
+                action="PARTIAL_CLOSE",
+                reason=f"bank_profit_effort_failure roe={trade.roe_pct:.1f}% vol={vr:.2f}x",
+                confidence=0.85,
+                close_ratio=c["vpa_bank_ratio"],
+                exit_reason=ExitReason.PROFIT_LOCK,
+                board_notes={"vpa_bank": True, "effort_status": status,
+                             "volume_ratio": vr, "roe": trade.roe_pct, "tightened_lock": lock},
+            )
+        if trade.roe_pct <= c["vpa_strict_roe_ceiling"]:
+            struct_failed = (
+                (trade.side == "BUY" and market.ema_fast > 0 and market.ema_slow > 0
+                 and market.ema_fast < market.ema_slow) or
+                (trade.side == "SELL" and market.ema_fast > 0 and market.ema_slow > 0
+                 and market.ema_fast > market.ema_slow))
+            opp = self._vpa_effort(market, opposing=True)
+            if opp.get("status") == "CONFIRMED" and struct_failed:
+                return TradeDecision(
+                    action="FULL_CLOSE",
+                    reason=f"strict_close_institutional_reversal roe={trade.roe_pct:.2f}%",
+                    confidence=0.95,
+                    exit_reason=ExitReason.INSTITUTIONAL_REVERSAL,
+                    board_notes={"strict_close": True, "effort_status": status,
+                                 "opposing_effort": opp.get("status"),
+                                 "structure_failure": True, "volume_ratio": vr},
+                )
+            if trade.roe_pct <= c["thesis_failure_threshold"] and vr >= 1.5:
+                return TradeDecision(
+                    action="FULL_CLOSE",
+                    reason=f"adverse_volume_thesis_failure roe={trade.roe_pct:.2f}% vol={vr:.2f}x",
+                    confidence=0.9,
+                    exit_reason=ExitReason.INSTITUTIONAL_REVERSAL,
+                    board_notes={"adverse_volume": True, "effort_status": status,
+                                 "volume_ratio": vr},
+                )
         return None
 
     def _check_trend_management(self, market: MarketSnapshot) -> Optional[TradeDecision]:

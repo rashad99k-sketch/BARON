@@ -59,7 +59,7 @@ def _price(symbol):
     return float(PRICES.get(str(symbol), 100.0))
 
 
-def _frame(n=250, side="BUY", base=100.0):
+def _frame(n=250, side="BUY", base=100.0, reaction=None):
     """Trending frame shaped so the REAL execute_entry gates approve:
     ADX inside [25,38] and the tail candle sweeps the relevant liquidity so
     detect_liquidity_context returns sell_side_taken / buy_side_taken."""
@@ -89,8 +89,18 @@ def _frame(n=250, side="BUY", base=100.0):
         c[n - 1] = prior_hi - 0.9
         h[n - 1] = prior_hi + 0.1
         l[n - 1] = prior_hi - 1.3
+    # Reaction overlay (news harness): always end with a CLEAR directional move
+    # (default BUY) so the REAL reaction-based news scanner measures it.
+    _d = 1.0 if str(reaction or "BUY").upper() in ("BULLISH", "BUY") else -1.0
+    c[n - 2] = c[n - 2] + _d * 0.4
+    o[n - 1] = c[n - 2]
+    c[n - 1] = c[n - 2] + _d * 0.9
+    h[n - 1] = max(h[n - 1], c[n - 1])
+    l[n - 1] = min(l[n - 1], c[n - 1])
+    volume = np.full(n, 1000.0)
+    volume[n - 1] += 400.0
     return pd.DataFrame({"timestamp": t, "open": o, "high": h,
-                         "low": l, "close": c, "volume": np.full(n, 1000.0)})
+                         "low": l, "close": c, "volume": volume})
 
 
 def _cand(sym, cls, side="BUY", score=88.0):

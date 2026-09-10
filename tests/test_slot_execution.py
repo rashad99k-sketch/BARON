@@ -42,7 +42,7 @@ def _price(symbol):
     return float(PRICES.get(str(symbol), 100.0))
 
 
-def _frame(n=250, side="BUY", base=100.0):
+def _frame(n=250, side="BUY", base=100.0, reaction=None):
     """Trending frame shaped so the REAL execute_entry gates approve:
     ADX inside [25,38] and the tail candle sweeps the relevant liquidity
     (low-side sweep for BUY, high-side sweep for SELL) so
@@ -73,9 +73,24 @@ def _frame(n=250, side="BUY", base=100.0):
         c[n - 1] = prior_hi - 0.9
         h[n - 1] = prior_hi + 0.1
         l[n - 1] = prior_hi - 1.3
+# Reaction overlay (news harness): ONLY when a news reaction is requested, end
+    # the last two bars with a CLEAR directional post-news move so the REAL
+    # reaction-based news scanner measures it deterministically. Technical
+    # frames keep their original shape (baseline management behavior).
+    if reaction is not None:
+        _d = 1.0 if str(reaction).upper() in ("BULLISH", "BUY") else -1.0
+        c[n - 2] = c[n - 2] + _d * 0.4
+        o[n - 1] = c[n - 2]
+        c[n - 1] = c[n - 2] + _d * 0.9
+        h[n - 1] = max(h[n - 1], c[n - 1])
+        l[n - 1] = min(l[n - 1], c[n - 1])
+        volume = np.full(n, 1000.0)
+        volume[n - 1] += 400.0
+    else:
+        volume = np.full(n, 1000.0)
     return pd.DataFrame({
         "timestamp": t, "open": o, "high": h, "low": l, "close": c,
-        "volume": np.full(n, 1000.0),
+        "volume": volume,
     })
 
 
@@ -110,8 +125,11 @@ class SixMarketSlotExecutionTest(unittest.TestCase):
         self.sides = {}
 
         def frame_provider(symbol, limit=120, htf=False):
-            return _frame(side=self.sides.get(str(symbol), "BUY"),
-                          base=_price(symbol))
+            _sym = str(symbol)
+            _nw = E.MEMORY.get("watchlist", {}).get(_sym)
+            _react = "BUY" if (_nw is not None and "news" in _nw) else None
+            return _frame(side=self.sides.get(_sym, "BUY"),
+                          base=_price(symbol), reaction=_react)
         E.get_ohlcv_safe = frame_provider
         E.get_ticker_safe = lambda symbol, retries=3: _price(symbol)
         E.get_orderbook_cached = lambda *a, **k: {
@@ -280,8 +298,11 @@ class NewsSlotExecutionTest(unittest.TestCase):
         self.sides = {}
 
         def frame_provider(symbol, limit=120, htf=False):
-            return _frame(side=self.sides.get(str(symbol), "BUY"),
-                          base=_price(symbol))
+            _sym = str(symbol)
+            _nw = E.MEMORY.get("watchlist", {}).get(_sym)
+            _react = "BUY" if (_nw is not None and "news" in _nw) else None
+            return _frame(side=self.sides.get(_sym, "BUY"),
+                          base=_price(symbol), reaction=_react)
         E.get_ohlcv_safe = frame_provider
         E.get_ticker_safe = lambda symbol, retries=3: _price(symbol)
         E.get_orderbook_cached = lambda *a, **k: {

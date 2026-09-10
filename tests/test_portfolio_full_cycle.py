@@ -47,7 +47,7 @@ def _price(symbol):
     return float(PRICES.get(str(symbol), 100.0))
 
 
-def _frame(n=250, base=100.0):
+def _frame(n=250, base=100.0, reaction=None):
     """Same trending frame family the T4 tests use: passes the REAL entry
     gates (ADX in [25,38] + sell-side liquidity sweep + strong reclaim)."""
     t = np.arange(n)
@@ -66,8 +66,22 @@ def _frame(n=250, base=100.0):
     c[n - 1] = prior_low + 0.9
     h[n - 1] = prior_low + 1.3
     l[n - 1] = prior_low - 0.1
+    # Reaction overlay (news harness): only for the NEWS symbol, and only when
+    # explicitly requested, end the frame with a CLEAR directional post-news
+    # move so the REAL reaction-based news scanner measures it deterministically.
+    if reaction is not None:
+        _d = 1.0 if str(reaction).upper() in ("BULLISH", "BUY") else -1.0
+        c[n - 2] = c[n - 2] + _d * 0.4
+        o[n - 1] = c[n - 2]
+        c[n - 1] = c[n - 2] + _d * 0.9
+        h[n - 1] = max(h[n - 1], c[n - 1])
+        l[n - 1] = min(l[n - 1], c[n - 1])
+        volume = np.full(n, 1000.0)
+        volume[n - 1] += 400.0
+    else:
+        volume = np.full(n, 1000.0)
     return pd.DataFrame({"timestamp": t, "open": o, "high": h,
-                         "low": l, "close": c, "volume": np.full(n, 1000.0)})
+                         "low": l, "close": c, "volume": volume})
 
 
 def _cand(sym, cls, side="BUY", score=88.0):
@@ -113,7 +127,9 @@ class SixSlotFullCycleTest(unittest.TestCase):
         self._saved = (E.get_ohlcv_safe, E.get_ticker_safe,
                        E.get_orderbook_cached, E.get_balance_safe)
         self._saved_perf = (dict(E.PERF), dict(E.DASHBOARD_STATE))
-        E.get_ohlcv_safe = lambda symbol, limit=120, htf=False: _frame(base=_price(symbol))
+        E.get_ohlcv_safe = lambda symbol, limit=120, htf=False: _frame(
+            base=_price(symbol),
+            reaction=("BUY" if "NCSKNVDA2" in str(symbol) else None))
         E.get_ticker_safe = lambda symbol, retries=3: _price(symbol)
         E.get_orderbook_cached = lambda *a, **k: {
             "bids": [[_price(a[0]) - 1.0, 10.0]], "asks": [[_price(a[0]) + 1.0, 5.0]]}
@@ -156,6 +172,13 @@ class SixSlotFullCycleTest(unittest.TestCase):
         cands.append(news_cand)
         opened = self.pm.open_top(cands, slots=6)
         self.assertEqual(opened, 6)
+        # The reaction overlay models a real post-news BUY jump: the market must
+        # actually trade above entry afterwards (a static flat ticker == entry
+        # would make the engine's synthetic breakeven SL hit on the next tick).
+        _news_sym = news_cand["symbol"]
+        _react_close = float(E.get_ohlcv_safe(_news_sym, 120)["close"].iloc[-1])
+        E.get_ticker_safe = lambda symbol, retries=3: (
+            _react_close if str(symbol) == _news_sym else _price(symbol))
         return news_cand
 
     def test_six_positions_open_simultaneously_including_news(self):
@@ -247,7 +270,9 @@ class ProfitTakingRealPathTest(unittest.TestCase):
         self._saved = (E.get_ohlcv_safe, E.get_ticker_safe,
                        E.get_orderbook_cached, E.get_balance_safe)
         self._saved_perf = (dict(E.PERF), dict(E.DASHBOARD_STATE))
-        E.get_ohlcv_safe = lambda symbol, limit=120, htf=False: _frame(base=_price(symbol))
+        E.get_ohlcv_safe = lambda symbol, limit=120, htf=False: _frame(
+            base=_price(symbol),
+            reaction=("BUY" if "NCSKNVDA2" in str(symbol) else None))
         E.get_ticker_safe = lambda symbol, retries=3: _price(symbol)
         E.get_orderbook_cached = lambda *a, **k: {
             "bids": [[_price(a[0]) - 1.0, 10.0]], "asks": [[_price(a[0]) + 1.0, 5.0]]}

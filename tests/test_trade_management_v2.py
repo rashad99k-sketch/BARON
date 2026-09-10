@@ -267,9 +267,10 @@ class TestTradeCouncil(unittest.TestCase):
         style = TradeCouncil.classify_trade_style(trade, market)
         self.assertEqual(style, TradeStyle.TREND)
 
-    def test_council_votes_five_named_members(self):
-        # Every evaluate() run records exactly the five named advisory members
-        # in trade.board_decisions["council_votes"], each with a verdict.
+    def test_council_votes_six_named_members(self):
+        # Every evaluate() run records exactly the six named advisory members
+        # (incl. VolumeTruth) in trade.board_decisions["council_votes"], each
+        # with a verdict.
         trade = Trade(
             symbol="BTC/USDT:USDT", side="BUY", asset_class="CRYPTO",
             entry_price=50000.0, original_qty=0.1, remaining_qty=0.1,
@@ -283,7 +284,7 @@ class TestTradeCouncil(unittest.TestCase):
         self.assertEqual(
             [v["name"] for v in votes],
             ["TrendRider", "ProfitGuardian", "RiskOfficer",
-             "ThesisOfficer", "ScalpDesk"],
+             "ThesisOfficer", "ScalpDesk", "VolumeTruth"],
         )
         for v in votes:
             self.assertIn(v["vote"], ("HOLD", "PARTIAL_CLOSE",
@@ -293,7 +294,7 @@ class TestTradeCouncil(unittest.TestCase):
             self.assertTrue(v["rationale"])
         self.assertTrue(decision.board_notes.get("council_votes"))
         # Same verdicts ride the decision board_notes for the close board.
-        self.assertEqual(len(decision.board_notes["council_votes"]), 5)
+        self.assertEqual(len(decision.board_notes["council_votes"]), 6)
 
     def test_council_votes_read_only(self):
         # The advisory layer must never mutate the trade beyond the normal
@@ -369,8 +370,8 @@ class TestTradeCouncil(unittest.TestCase):
         self.assertEqual(trade.client_order_id, expected)
         self.assertLessEqual(len(expected), 40)
         self.assertRegex(expected, r"^[A-Za-z0-9_]+$")
-        # Board votes were attached on open.
-        self.assertEqual(len(trade.board_decisions.get("entry_votes", [])), 5)
+        # Board votes were attached on open (6 members incl. VolumeTruth).
+        self.assertEqual(len(trade.board_decisions.get("entry_votes", [])), 6)
         # Opening the same symbol again is blocked (idempotency).
         self.assertIsNone(coord.open_trade(candidate, lambda s, c: True,
                                            fake_execute))

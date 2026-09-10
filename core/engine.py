@@ -134,6 +134,35 @@ try:
 except Exception:  # pragma: no cover
     session_allows_entry = None
 
+# VPA / Volume Intelligence layer (Effort-vs-Result). Pure additive volume
+# interrogation over the causal OB engine; safe to import unconditionally.
+try:
+    from core.vpa_volume import (
+        ob_volume_dna,
+        effort_result,
+        retest_health,
+        volume_validation,
+        opposing_ob_conflict,
+    )
+    VPA_AVAILABLE = True
+except Exception as _vpa_import_err:  # pragma: no cover - defensive
+    VPA_AVAILABLE = False
+
+    def ob_volume_dna(*a, **k):
+        return {"complete": False}
+
+    def effort_result(*a, **k):
+        return {"status": "STALL"}
+
+    def retest_health(*a, **k):
+        return {"status": "NEUTRAL"}
+
+    def volume_validation(*a, **k):
+        return "NO_CONFIRMATION", {"status": "NO_CONFIRMATION"}
+
+    def opposing_ob_conflict(*a, **k):
+        return {"present": False}
+
 # Pure institutional setup intelligence. It never places orders and is safe to
 # use as an evidence layer around the preserved execution kernel.
 try:
@@ -13347,6 +13376,7 @@ class ExecutionCandidate:
     ob_grade: str = "NONE"
     is_a_grade: bool = False
     strong_ob_present: bool = False
+    vpa: dict = field(default_factory=dict)
     roro_score: float = 0.0
     institutional_score: float = 0.0
     institutional_status: str = "NEUTRAL"
@@ -14750,6 +14780,13 @@ class ExecutionQueue:
                     df, cand.side, atr, cand.entry_price,
                     prepared=bool(cand.institutional_prepared and int(cand.precursor_count) >= 1))
                 cand.evidence = dict(self._last_evidence)
+                try:
+                    cand.vpa = ob_volume_dna(df, cand.side, atr, -1,
+                                             cand.zone_low, cand.zone_high) or {}
+                except Exception:
+                    cand.vpa = {}
+                if not isinstance(cand.vpa, dict):
+                    cand.vpa = {}
                 confirm_triggers = ("MSS_CONFIRMED", "LIQUIDITY_SWEEP", "BOS_CONFIRMED", "CHOCH_CONFIRMED", "RETEST_CONFIRMED")
                 # ---- PERSISTENT CONFIRMATION STATE MACHINE (forensic RC#1) ----
                 # Confirmation is earned over DISTINCT valid events/candles (candle
@@ -15235,7 +15272,14 @@ class ExecutionQueue:
                 rejection = float(last['low']) <= zone_high and float(last['close']) > float(last['open'])
             else:
                 rejection = float(last['high']) >= zone_low and float(last['close']) < float(last['open'])
-        if rejection:
+        try:
+            self._last_vpa = ob_volume_dna(df, side, atr, idx, zone_low, zone_high) or {}
+        except Exception:
+            self._last_vpa = {}
+        if not isinstance(self._last_vpa, dict):
+            self._last_vpa = {}
+        under_attack = bool(self._last_vpa.get("under_attack"))
+        if rejection and not under_attack:
             score += 8.0
         synergy = self._ob_synergy(df, side, atr, idx, zone_low, zone_high, cfg)
         score += synergy["bonus"]
@@ -16058,10 +16102,20 @@ class ExecutionQueue:
         require_pd = bool((cfg or {}).get("ob_require_pd_aplus", False))
         sweep_ok = (not require_sweep) or bool(synergy.get("sweep_aligned", False))
         pd_ok = (not require_pd) or bool(synergy.get("pd_aligned", False))
+        # VPA Volume-DNA interrogator: retest health, effort/result, opposing OBs.
+        try:
+            vpa = ob_volume_dna(df, side, atr, zbar, zl, zh) or {}
+        except Exception:
+            vpa = {}
+        if not isinstance(vpa, dict):
+            vpa = {}
+        vpa_under_attack = bool(vpa.get("under_attack"))
         if (ob_score >= 85 and best_disp > 1.5 and freshness <= fresh_aplus
-                and vol_ratio > 1.5 and ztouch <= 1 and sweep_ok and pd_ok):
+                and vol_ratio > 1.5 and ztouch <= 1 and sweep_ok and pd_ok
+                and not vpa_under_attack):
             grade = "A+"
-        elif ob_score >= 75 and best_disp > 0.8 and freshness <= fresh_a and vol_ratio > 1.2:
+        elif ob_score >= 75 and best_disp > 0.8 and freshness <= fresh_a and vol_ratio > 1.2 \
+                and not vpa_under_attack:
             grade = "A"
         elif ob_score >= 55 and best_disp > 0.4 and freshness <= fresh_b:
             grade = "B"
@@ -16077,7 +16131,8 @@ class ExecutionQueue:
             'displacement_atr': round(best_disp, 2),
             'volume_ratio': round(vol_ratio, 2),
             'touches': ztouch,
-            'synergy': synergy
+            'synergy': synergy,
+            'vpa': vpa
         }
 
     def _is_order_block_broken_from_zone(self, df, side, zone_low, zone_high, atr):
@@ -16105,6 +16160,8 @@ class ExecutionQueue:
         if not cand.evidence.get("rejection_or_displacement", False):
             return False
         if cand.zone_metrics.liquidity_quality < 60:
+            return False
+        if (cand.vpa or {}).get("under_attack"):
             return False
         return True
 
@@ -16211,6 +16268,11 @@ class ExecutionQueue:
                            else f"FAIL({cand.latest_adx:.1f}>{max_adx:.0f})")
 
         score_gate_status = "PASS" if score >= ready_required else f"FAIL({score:.1f}<{ready_required:.0f})"
+        # VPA gate: an OB whose retest is UNDER_ATTACK (close through the zone on
+        # expanding directional volume / demand failure) is NEVER ready to trade.
+        vpa_ok = not bool((cand.vpa or {}).get("under_attack"))
+        vpa_gate_status = ("PASS" if vpa_ok
+                           else f"FAIL(OB_UNDER_ATTACK {str((cand.vpa or {}).get('retest', {}).get('reasons', []))[:60]})")
         gates = {
             "confirmation": "PASS" if conf_ok else f"FAIL({cand.confirmation_count}/{min_confirmations})",
             "score": score_gate_status,
@@ -16219,6 +16281,7 @@ class ExecutionQueue:
             "evidence": "PASS" if evidence_ok else f"FAIL({label})",
             "adx": adx_gate_status,
             "atom": atom_gate_status,
+            "vpa": vpa_gate_status,
         }
 
         # Explicit, machine-readable primary blocker. A non-READY candidate is
@@ -16244,6 +16307,10 @@ class ExecutionQueue:
         elif not atom_gate_ok:
             blocker = "ATOM"
             reasons = {"atom_approved": bool(cand.atom_approved)}
+        elif not vpa_ok:
+            blocker = "OB_UNDER_ATTACK"
+            reasons = {"vpa_retest": (cand.vpa or {}).get("retest", {}).get("reasons", []),
+                       "volume_ratio": (cand.vpa or {}).get("volume_ratio", 1.0)}
         elif score < ready_required:
             # PASS-viable but below the READY floor: expose READY_SCORE_FLOOR.
             blocker = "READY_SCORE_FLOOR"
@@ -16288,7 +16355,7 @@ class ExecutionQueue:
                 log_execution(f"[LATENCY] {cand.symbol}: institutional_analysis_time missing", "WARN")
         if conf_ok:
             if (score >= ready_required and trigger_gate and in_entry_window
-                    and evidence_ok and atom_gate_ok and adx_ok):
+                    and evidence_ok and atom_gate_ok and adx_ok and vpa_ok):
                 was_ready = cand.state == ExecutionState.READY
                 cand.state = ExecutionState.READY
                 cand.confirmation_state = "CONFIRMED_2" if min_confirmations >= 2 else "CONFIRMED_1"

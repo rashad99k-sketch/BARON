@@ -27,11 +27,104 @@ Design contract
 
 from __future__ import annotations
 
+import hashlib
 import os
+import time
 from typing import Optional
 
 # News strength threshold (headline-level impact sufficient to drive the slot).
 _MIN_IMPACT = float(os.getenv("NEWS_SLOT_MIN_IMPACT", "0.55"))
+# Reaction steering: the post-news price reaction decides BUY vs SELL, not the
+# raw headline bias. A reaction is only "clear" when the net closed-bar move
+# over `reaction_bars` candles is >= `min_move_atr` ATR. No clear reaction yet
+# -> the slot WAITS (candidate skipped this cycle, retried when it prints).
+_REACTION_BARS = int(os.getenv("NEWS_REACTION_BARS", "3"))
+_REACTION_MIN_ATR = float(os.getenv("NEWS_REACTION_MIN_ATR", "0.5"))
+# One news event -> exactly one trade (even after the trade closes, the same
+# headline is not re-traded within this window).
+_REACTION_DEDUP_SEC = float(os.getenv("NEWS_REACTION_DEDUP_SEC", "14400"))
+_DEDUP_MEMORY_KEY = "news_slot_opened_events"
+# React to the primary headline as it reads on the wire.
+def _headline_key(sym: str, entry: dict) -> str:
+    try:
+        ass = entry.get("news")
+        if hasattr(ass, "headlines"):
+            hl = list(getattr(ass, "headlines", None) or [])
+        else:
+            hl = list((ass or {}).get("headlines", []) or [])
+        first = hl[0] if hl else {}
+        title = str(first.get("headline") or first.get("title") or "")
+    except Exception:
+        title = ""
+    return f"{sym}|{hashlib.sha256(title.encode('utf-8', 'ignore')).hexdigest()[:16]}"
+
+
+def news_event_already_traded(sym: str, entry: dict) -> bool:
+    """True when this symbol+headline already produced (or is producing) a
+    trade, enforcing the one-trade-per-news-event contract."""
+    try:
+        from core import engine as E
+    except Exception:
+        return False
+    mem = getattr(E, "MEMORY", None)
+    if mem is None:
+        return False
+    recs = mem.setdefault(_DEDUP_MEMORY_KEY, {})
+    key = _headline_key(sym, entry)
+    rec = recs.get(key)
+    if not rec:
+        return False
+    if time.time() - float(rec.get("ts", 0)) > _REACTION_DEDUP_SEC:
+        recs.pop(key, None)
+        return False
+    return True
+
+
+def mark_news_event_traded(cand: dict) -> None:
+    """Record the opened trade's news event so the same headline is not re-opened."""
+    key = cand.get("news_event_key")
+    if not key:
+        return
+    try:
+        from core import engine as E
+    except Exception:
+        return
+    mem = getattr(E, "MEMORY", None)
+    if mem is not None:
+        mem.setdefault(_DEDUP_MEMORY_KEY, {})[key] = {"ts": time.time()}
+
+
+def evaluate_reaction_direction(df, atr: float,
+                                reaction_bars: int = None,
+                                min_move_atr: float = None) -> Optional[str]:
+    """Direction implied by the market's post-news REACTION over the last
+    `reaction_bars` closed candles. Returns 'BUY' / 'SELL' when the net move is
+    clear, else None (= reaction not ready yet; the slot must keep waiting)."""
+    bars = int(reaction_bars if reaction_bars is not None else _REACTION_BARS)
+    if df is None or len(df) < max(bars, 8):
+        return None
+    try:
+        # The reaction is a property of the CANDLES: measure it against the
+        # frame's own volatility so harness/routing ATR mismatch is harmless.
+        _atr = 0.0
+        try:
+            from core.vpa_volume import atr_proxy
+            _atr = atr_proxy(df, 0.0)
+        except Exception:
+            _atr = 0.0
+        if _atr <= 0:
+            _atr = float(atr) if atr and float(atr) > 0 else 0.0
+        if _atr <= 0:
+            return None
+        net = (float(df["close"].iloc[-1]) - float(df["close"].iloc[-1 - bars])) / _atr
+    except Exception:
+        return None
+    thr = float(min_move_atr if min_move_atr is not None else _REACTION_MIN_ATR)
+    if net >= thr:
+        return "BUY"
+    if net <= -thr:
+        return "SELL"
+    return None
 
 
 def news_strong(assessment) -> bool:
@@ -103,10 +196,34 @@ def scan_for_news_candidate(watchlist) -> Optional[dict]:
         price = float(entry.get("price") or 0)
         if not price:
             continue
+        atr = float(entry.get("atr") or price * 0.01) or price * 0.01
+
+        # User contract: WAIT for the post-news price reaction -- it decides
+        # BUY vs SELL, not the raw headline bias. When live candles are
+        # available and the reaction is not yet clear, the symbol is skipped so
+        # the slot re-tries on the next cycle (it never opens on guesswork).
+        reaction = None
+        live_data = False
+        try:
+            from core import engine as E
+            _df = E.get_ohlcv_safe(sym, 60)
+        except Exception:
+            _df = None
+        if _df is not None and len(_df) >= 8:
+            live_data = True
+            reaction = evaluate_reaction_direction(_df, atr)
+        if live_data:
+            if reaction is None:
+                continue  # reaction not printed yet -> wait
+            direction = reaction
+
+        # One trade per news event (symbol + headline fingerprint).
+        if news_event_already_traded(sym, entry):
+            continue
+
         conf = _news_confidence(assessment)
         if conf > best_conf:
             best_conf = conf
-            atr = float(entry.get("atr") or price * 0.01) or price * 0.01
             cand = {
                 "symbol": sym,
                 "side": direction,
@@ -123,6 +240,8 @@ def scan_for_news_candidate(watchlist) -> Optional[dict]:
                 "impact": _impact_label(assessment),
                 "direction": "LONG" if direction == "BUY" else "SHORT",
                 "news": assessment.as_dict() if hasattr(assessment, "as_dict") else {},
+                "reaction_based": bool(live_data),
+                "news_event_key": _headline_key(sym, entry),
             }
             cand.update(_risk_levels(price, atr, direction))
             best = cand

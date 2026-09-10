@@ -444,6 +444,12 @@ def execute_news_slot():
     try:
         if PORTFOLIO.open_candidate(cand):
             _gate("news_executed")
+            # One news event -> exactly one trade: fingerprint the headline so a
+            # later scan never re-opens the same event (even after it closed).
+            try:
+                news_slot.mark_news_event_traded(cand)
+            except Exception:
+                pass
             E.record_gate_event(cand["symbol"], "EXECUTION", "NEWS_SLOT_EXECUTED",
                                 f"side={cand['side']}", None)
             log_execution(

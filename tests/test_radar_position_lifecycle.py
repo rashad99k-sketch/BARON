@@ -85,7 +85,7 @@ def _price(symbol):
     return float(PRICES.get(str(symbol), 100.0))
 
 
-def _frame(base: float, n: int = 250) -> pd.DataFrame:
+def _frame(base: float, n: int = 250, reaction: str = None) -> pd.DataFrame:
     """Same trending frame family the T4/T6 tests use: passes all entry gates."""
     t = np.arange(n)
     x = base + 3.0 * (1 - np.exp(-t / 900.0)) + 1.5 * np.sin(t / 6.0)
@@ -103,8 +103,22 @@ def _frame(base: float, n: int = 250) -> pd.DataFrame:
     c[n - 1] = prior_low + 0.9
     h[n - 1] = prior_low + 1.3
     l[n - 1] = prior_low - 0.1
+    # Reaction overlay (news harness): ONLY for the news symbol, end the frame
+    # with a CLEAR directional post-news move so the REAL reaction-based news
+    # scanner measures it deterministically.
+    if reaction is not None:
+        _d = 1.0 if str(reaction).upper() in ("BULLISH", "BUY") else -1.0
+        c[n - 2] = c[n - 2] + _d * 0.4
+        o[n - 1] = c[n - 2]
+        c[n - 1] = c[n - 2] + _d * 0.9
+        h[n - 1] = max(h[n - 1], c[n - 1])
+        l[n - 1] = min(l[n - 1], c[n - 1])
+        volume = np.full(n, 1000.0)
+        volume[n - 1] += 400.0
+    else:
+        volume = np.full(n, 1000.0)
     return pd.DataFrame({"timestamp": t, "open": o, "high": h,
-                         "low": l, "close": c, "volume": np.full(n, 1000.0)})
+                         "low": l, "close": c, "volume": volume})
 
 
 def _quiet_frame(base: float, n: int = 250) -> pd.DataFrame:
@@ -126,8 +140,9 @@ class FakeExchange:
 
 
 def _ohlcv(symbol, limit=120, htf=False):
-    df = _frame(base=_price(symbol)) if symbol in FRAME_STRONG \
-        else _quiet_frame(base=_price(symbol))
+    df = _frame(base=_price(symbol),
+                reaction=("BUY" if "NCSKNVDA2" in str(symbol) else None)) \
+        if symbol in FRAME_STRONG else _quiet_frame(base=_price(symbol))
     df.symbol = symbol
     return df
 

@@ -948,7 +948,91 @@ class DeepScanner:
             if (best["side"] == "BUY" and ob_imbalance >= 0.15) or (best["side"] == "SELL" and ob_imbalance <= -0.15):
                 reasons.append("LOB Imbalance")
 
-            strength = "STRONG" if score >= 8 else "MEDIUM" if score >= 5 else "WEAK"
+            # ---- STRONG Tier (5 gates) ------------------------------------
+            # STRONG is a tier, not "score >= 8": (1) Watch score >= 8,
+            # (2) clear side, (3) causal OB grade >= B, (4) Volume Validation,
+            # (5) no opposing A/A+ OB nearby / no severe distribution-against-
+            # BUY or accumulation-against-SELL. MEDIUM stays a PRE-STRONG tier
+            # that already promotes institutional analysis into the radar.
+            strength = "WEAK"
+            strong_gate = {"score": False, "direction": False, "ob": False,
+                           "volume": False, "conflict": False}
+            strong_caution: list = []
+            strong_reason = ""
+            ob_grade_here = "NONE"
+            ob_vpa_here: dict = {}
+            obev = {}
+            try:
+                _atr_here = float(E.compute_atr(df).iloc[-1]) if len(df) > 14 else 0.0
+                _cls = E.AssetBehaviorProfile.resolve_asset_class(sym)
+                obev = E.queue._select_strong_ob(
+                    df, str(best.get("side", "")), _atr_here,
+                    E.AssetBehaviorProfile.ob_config(_cls)) or {}
+                if isinstance(obev, dict):
+                    ob_grade_here = str(obev.get("grade", "NONE"))
+                    _v = obev.get("vpa") or {}
+                    ob_vpa_here = _v if isinstance(_v, dict) else {}
+            except Exception:
+                ob_grade_here, ob_vpa_here = "NONE", {}
+            if score >= 8:
+                strong_gate["score"] = True
+            if str(best.get("side", "")) in ("BUY", "SELL"):
+                strong_gate["direction"] = True
+            if ob_grade_here in ("A+", "A", "B"):
+                strong_gate["ob"] = True
+            if ob_vpa_here.get("under_attack"):
+                strong_gate["volume"] = False
+                strong_caution.append("OB_UNDER_ATTACK")
+            else:
+                try:
+                    _vt, _vd = E.volume_validation(
+                        df, str(best.get("side", "")), _atr_here,
+                        float(obev.get("displacement_atr", 0.0)) if isinstance(obev, dict) else 0.0,
+                        float(ob_vpa_here.get("volume_ratio", 1.0)),
+                        ob_vpa_here.get("retest") or {})
+                except Exception:
+                    _vt, _vd = "NO_CONFIRMATION", {}
+                strong_gate["volume"] = bool(_vt) and _vt in (
+                    "VOLUME_CONFIRMED", "DISPLACEMENT_VOLUME_CONFIRMED", "ABSORPTION_CONFIRMED")
+                if not strong_gate["volume"]:
+                    strong_caution.append(f"VOLUME:{_vt}")
+            _conflict = ob_vpa_here.get("opposing_conflict") or {}
+            if isinstance(_conflict, dict) and _conflict.get("present"):
+                strong_gate["conflict"] = False
+                strong_caution.append(f"OPPOSING_{str(_conflict.get('side', 'OB'))}_NEARBY")
+            else:
+                try:
+                    _opp_eff = E.effort_result(
+                        df, "SELL" if str(best.get("side", "")) == "BUY" else "BUY",
+                        _atr_here, lookback=3) or {}
+                    if str(best.get("side", "")) == "BUY" and _opp_eff.get("status") == "WEAK_RESULT":
+                        strong_gate["conflict"] = False
+                        strong_caution.append("SEVERE_DISTRIBUTION")
+                    elif str(best.get("side", "")) == "SELL" and _opp_eff.get("status") == "WEAK_RESULT":
+                        strong_gate["conflict"] = False
+                        strong_caution.append("SEVERE_ACCUMULATION")
+                    else:
+                        strong_gate["conflict"] = True
+                except Exception:
+                    strong_gate["conflict"] = True
+            is_strong = all(strong_gate.values())
+            if is_strong:
+                strength = "STRONG"
+            elif score >= 5:
+                strength = "MEDIUM"
+            else:
+                strength = "WEAK"
+            _retest_h = str((ob_vpa_here.get("retest") or {}).get("status", "HEALTHY"))
+            strong_reason = (
+                f"OB_G:{ob_grade_here} OB_VOL:{float(ob_vpa_here.get('volume_ratio', 1.0)):.1f}x "
+                f"DISP:{float(obev.get('displacement_atr', 0.0)):.2f}ATR "
+                f"E/R:{ob_vpa_here.get('effort_result', '?')} "
+                f"VOL:{_vt if strong_gate['volume'] else 'NO_CONFIRMATION'} "
+                f"SWEEP:{1 if 'Liquidity Sweep' in reasons else 0} "
+                f"BOS:{1 if 'BOS/CHoCH' in reasons else 0} "
+                f"RETEST:{'HEALTHY' if _retest_h == 'HEALTHY' else _retest_h} "
+                f"OPPOSING:{'NONE' if strong_gate['conflict'] else ','.join(strong_caution)}"
+            )
             smart = best.get("smart_money") or {}
             momentum = best.get("momentum") or {}
             intent_details = best.get("intent_details") or {}
@@ -1115,6 +1199,13 @@ class DeepScanner:
                     "intent_details": intent_details,
                     "state": state,
                     "strength": strength,
+                    "strong_gate": strong_gate,
+                    "strong_caution": strong_caution,
+                    "strong_reason": strong_reason,
+                    "strong_status": ("STRONG" if is_strong else "CAUTION" if strong_caution and score >= 5 else "WEAK"),
+                    "ob_grade": ob_grade_here,
+                    "ob_vpa": ob_vpa_here,
+                    "pre_strong": str(strength).upper() == "MEDIUM" and score >= 5,
                     "reasons": reasons or ["Deep Analysis"],
                     "trade_type": "REVERSAL" if (narrative.get("sweep") or narrative.get("retest")) else "TREND",
                     "smart_money_bias": smart.get("institutional_bias", "NEUTRAL"),
