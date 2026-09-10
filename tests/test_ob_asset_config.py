@@ -8,6 +8,7 @@ spread caps. Signatures gain an optional cfg param so legacy paths are
 untouched when no config is supplied.
 """
 import importlib
+import importlib.util
 import os
 import sys
 import unittest
@@ -39,8 +40,20 @@ def _load_engine():
         ccxt_mod.bingx = FakeBingX
         sys.modules["ccxt"] = ccxt_mod
     sys.modules["flask"] = _fake_flask_with(_FakeFlask)
-    sys.modules.pop("core.engine", None)
-    engine = importlib.import_module("core.engine")
+    # Re-execute the engine under a PRIVATE name so the shared core.engine
+    # identity (bound by portfolio.manager and the live-brain harnesses) is
+    # never evicted / orphaned mid-suite.
+    orig_engine = saved["core.engine"]
+    if orig_engine is not None:
+        spec = importlib.util.spec_from_file_location("_ob_asset_fresh_engine", orig_engine.__file__)
+        engine = importlib.util.module_from_spec(spec)
+        sys.modules["_ob_asset_fresh_engine"] = engine
+        try:
+            spec.loader.exec_module(engine)
+        finally:
+            sys.modules.pop("_ob_asset_fresh_engine", None)
+    else:
+        engine = importlib.import_module("core.engine")
     return engine, saved, old_paper
 
 
@@ -113,7 +126,6 @@ class _EngineTestCase(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        sys.modules.pop("core.engine", None)
         for name, module in cls.saved.items():
             if module is None:
                 sys.modules.pop(name, None)

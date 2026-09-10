@@ -509,6 +509,13 @@ DEFAULT_SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
 INTERVAL = os.getenv("INTERVAL", "15m")
 LEVERAGE = 10
 
+# The institutional distribution/decay full-exit (distribution_risk>65 with
+# momentum decay) only fires on a FLAT cost basis (roe<=0, legacy book reset)
+# or once the position has REAL ROE to justify banking it. Seats resting in a
+# small profit inside the TP1 zone (0 < ROE < this floor) stay seated until a
+# genuine TP1 partial, a hard protective exit, or the runner ladder.
+PROFIT_LOCK_MIN_ROE = 5.0
+
 USE_PPE = True
 
 # === EXECUTION QUEUE CONFIGURATION ===
@@ -619,6 +626,23 @@ def set_leverage(symbol, leverage):
 _live_high = {}
 _live_low = {}
 _last_candle_timestamp = {}
+
+def reset_live_hybrid_cache(symbol=None):
+    """Drop per-symbol live-bar extreme caches.
+
+    Used by the portfolio manager when a NEW trade instance starts managing a
+    symbol: a replayed/re-seeded frame for the same symbol must never inherit
+    another trade's synthetic high/low (timestamp buckets can collide across
+    sessions with different underlying frames).
+    """
+    if symbol is None:
+        _last_candle_timestamp.clear()
+        _live_high.clear()
+        _live_low.clear()
+    else:
+        _last_candle_timestamp.pop(symbol, None)
+        _live_high.pop(symbol, None)
+        _live_low.pop(symbol, None)
 
 def get_live_hybrid_df(symbol, base_df: pd.DataFrame, live_price: float) -> pd.DataFrame:
     if base_df is None or base_df.empty or live_price is None or live_price <= 0:
@@ -3513,6 +3537,109 @@ def _hedge_position_side(direction):
     raise ValueError(f"cannot derive hedge positionSide from direction: {direction!r}")
 
 
+def _close_client_order_id(symbol=None):
+    """Deterministic clientOrderId for a CLOSE intent, bound to the trade id.
+
+    The same close intent always maps to the same clientOrderId so a confirm
+    timeout can reconcile the exact idempotency key on the venue before any
+    retry is considered (never a blind, possibly-double-closing retry).
+    """
+    tid = str(STATE.get("trade_id") or "").strip()
+    if not tid:
+        sym_raw = str(STATE.get("current_symbol") or symbol or "?")\
+            .replace("/", "-").replace(":", "-")
+        tid = f"{sym_raw}-{int(float(STATE.get('entry_time') or time.time()))}"
+    tid = tid.replace("-", "_")
+    # "BARON_" (6) + tid + "_CLOSE" (6) must stay <=40: keep the unique TAIL
+    # (trade token) rather than the head when trimming, so two long trade_ids
+    # sharing a symbol prefix can never collapse into the same close key.
+    return f"BARON_{tid[-28:]}_CLOSE"[:40]
+
+
+def _synthetic_close_record_from_order(order, symbol, close_cid, expected_qty=None):
+    """Verify an exchange order record PROVES a close fill for the close intent.
+
+    Returns (filled_qty: float) when the order is effectively a filled close for
+    our clientOrderId; returns None when it does not prove a fill."""
+    try:
+        status = str(order.get("status", "") or "").lower()
+        if status not in ("closed", "filled", "partially_filled", "filling"):
+            return None
+        filled = float(order.get("filled", 0) or 0)
+        amount = float(order.get("amount", 0) or 0)
+        proven = filled if filled > 0 else amount
+        if proven <= 0:
+            return None
+        cid_from_order = str(order.get("clientOrderId") or "").strip()
+        if cid_from_order and close_cid and cid_from_order != close_cid:
+            return None
+        if expected_qty is not None:
+            # Only trust orders that at least touched the expected volume.
+            if proven < float(expected_qty) * 0.999:
+                return None
+        return proven
+    except Exception:
+        return None
+
+
+def _reconcile_close_timeout(symbol, direction, close_cid, expected_qty, expected=None, retries=2):
+    """Timeout-reconciliation for a CLOSE order (BingX Hedge Mode).
+
+    A close create_order that may have executed must NEVER be blindly retried
+    (a second market close after a real fill flips the position the other way).
+    Lookup order:
+      1. clientOrderId-first: fetch_order / order-list scan proving OUR close
+         intent filled.
+      2. position check: whether the position for this hedge side shrank for a
+         partial close, or vanished for a full close, vs. the expected quantity.
+    Returns True only when a lookup PROVES the close (or its effect) happened,
+    False when it stays UNKNOWN (caller must NOT retry blindly).
+    """
+    desired = "long" if str(direction).upper() in ("BUY", "LONG") else "short"
+    sym = normalize_symbol(symbol)
+    try:
+        if close_cid:
+            try:
+                order = safe_api_call(
+                    ex.fetch_order, close_cid, sym,
+                    params={"clientOrderId": close_cid})
+                if order is not None:
+                    proven = _synthetic_close_record_from_order(
+                        order, sym, close_cid, expected_qty)
+                    if proven is not None:
+                        return True
+            except Exception:
+                pass
+            try:
+                orders = None
+                if hasattr(ex, "fetch_orders"):
+                    orders = safe_api_call(ex.fetch_orders, [sym])
+                if (orders is None or not orders) and hasattr(ex, "fetch_open_orders"):
+                    orders = safe_api_call(ex.fetch_open_orders, [sym])
+                if orders:
+                    for order in orders:
+                        if str(order.get("clientOrderId") or "") == close_cid:
+                            proven = _synthetic_close_record_from_order(
+                                order, sym, close_cid, expected_qty)
+                            if proven is not None:
+                                return True
+            except Exception:
+                pass
+        # 2) Position evidence for this hedge side.
+        pos = fetch_position(symbol)
+        if pos is not None:
+            side = str(pos.get("side", "")).lower()
+            contracts = float(pos.get("contracts", 0.0) or 0.0)
+            threshold = 0.0 if expected is None else float(expected) * 1.001
+            if contracts <= threshold and (side in (desired, "") or contracts <= 0):
+                return True
+            if side and side != desired:
+                return False
+        return False
+    except Exception:
+        return False
+
+
 def close_partial(ratio):
     global _closing_in_progress, _reconciliation_pending
     if _closing_in_progress:
@@ -3560,7 +3687,13 @@ def close_partial(ratio):
         side = "sell" if STATE["side"] == "BUY" else "buy"
         sym = normalize_symbol(symbol)
         qty_precise = float(ex.amount_to_precision(sym, qty_to_close))
-        order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"positionSide": _hedge_position_side(STATE["side"])})
+        # Deterministic per-close-intent clientOrderId: a timeout reconciliation
+        # can look the exact idempotency key up BEFORE any retry is considered.
+        close_cid = _close_client_order_id(symbol)
+        order = safe_api_call(
+            ex.create_order, sym, "market", side, qty_precise,
+            params={"positionSide": _hedge_position_side(STATE["side"]),
+                    "clientOrderId": close_cid})
         if order is None:
             log_execution("[CLOSE_PARTIAL] Order creation failed (None)", "ERROR")
             return False
@@ -3613,8 +3746,27 @@ def close_partial(ratio):
             _exchange_sync.reconcile(symbol, STATE)
             _ok = True
         else:
-            log_execution(f"[CLOSE_PARTIAL] Partial close failed to fill after timeout", "ERROR")
-            _exchange_sync.reconcile(symbol, STATE)
+            log_execution(f"[CLOSE_PARTIAL] Partial close failed to verify ({close_cid})", "ERROR")
+            # Confirm timeout: reconcile by clientOrderId FIRST, then position;
+            # never blind-retry a close that may have executed.
+            expected_remaining = max(0.0, float(STATE.get("remaining_qty", 0.0)) - qty_precise)
+            if _reconcile_close_timeout(symbol, STATE["side"], close_cid, qty_precise,
+                                        expected=expected_remaining):
+                log_execution(
+                    f"[CLOSE_PARTIAL] Recovery proved the partial close filled "
+                    f"({close_cid}); booking leg at mark", "INFO")
+                time.sleep(1)
+                pos = fetch_position(symbol)
+                if pos is None:
+                    STATE["open"] = False
+                    TRADE_STATE["in_position"] = False
+                    DASHBOARD_STATE["live_trade_mode"] = False
+                else:
+                    STATE["remaining_qty"] = max(0.0, float(pos.get("contracts", 0.0)))
+                    TRADE_STATE["qty"] = STATE["remaining_qty"]
+                _exchange_sync.reconcile(symbol, STATE)
+            else:
+                _exchange_sync.reconcile(symbol, STATE)
     except Exception as e:
         log_execution(f"[CLOSE_PARTIAL] Error: {traceback.format_exc()}", "ERROR")
     finally:
@@ -3659,51 +3811,79 @@ def close_position_full():
         sym = normalize_symbol(symbol)
         qty_precise = float(ex.amount_to_precision(sym, qty_to_close))
 
+        # Deterministic per-close-intent clientOrderId: timeouts are reconciled by
+        # this exact idempotency key BEFORE any retry — a blind retry after a
+        # real fill would flip the position in Hedge Mode. The id stays stable
+        # across rejections (safe: rejected orders filled nothing on the venue).
+        close_cid = _close_client_order_id(symbol)
+
         for attempt in range(3):
-            order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"positionSide": _hedge_position_side(STATE["side"])})
-            if order is None:
-                log_execution(f"[CLOSE] Order creation failed (attempt {attempt+1})", "ERROR")
-                time.sleep(1)
-                continue
-            order_id = order.get('id')
-            if not order_id:
-                log_execution(f"[CLOSE] No order ID returned (attempt {attempt+1})", "ERROR")
+            params = {"positionSide": _hedge_position_side(STATE["side"]),
+                      "clientOrderId": close_cid}
+            order = safe_api_call(ex.create_order, sym, "market", side,
+                                  qty_precise, params=params)
+            if order is None or not order.get('id'):
+                # Definite rejection (create_order answered, no order accepted):
+                # nothing may have executed, so retrying the SAME key is safe.
+                log_execution(
+                    f"[CLOSE] Order creation rejected (attempt {attempt+1}, "
+                    f"cid={close_cid})", "ERROR")
                 time.sleep(1)
                 continue
 
-            filled, filled_qty = verify_order_filled(symbol, order_id, side, qty_precise, timeout=10)
+            filled, filled_qty = verify_order_filled(
+                symbol, order["id"], side, qty_precise, timeout=10)
             if filled:
                 time.sleep(1)
                 pos = fetch_position(symbol)
-                if pos is None:
-                    log_execution("[CLOSE] Position confirmed closed (no position found)", "SUCCESS")
+                if pos is None or float(pos.get('contracts', 0)) <= 0:
+                    log_execution("[CLOSE] Position confirmed closed", "SUCCESS")
                     STATE["open"] = False
                     TRADE_STATE["in_position"] = False
                     DASHBOARD_STATE["live_trade_mode"] = False
                     finalize_trade_with_reality(symbol)
                     return True
-                else:
-                    current_qty = float(pos.get('contracts', 0))
-                    if current_qty <= 0:
-                        log_execution("[CLOSE] Position confirmed closed (qty=0)", "SUCCESS")
-                        STATE["open"] = False
-                        TRADE_STATE["in_position"] = False
-                        DASHBOARD_STATE["live_trade_mode"] = False
-                        finalize_trade_with_reality(symbol)
-                        return True
-                    else:
-                        log_execution(f"[CLOSE] Position still has qty {current_qty:.6f} after close order. Retrying...", "WARN")
-                        qty_to_close = current_qty
-                        qty_precise = float(ex.amount_to_precision(sym, qty_to_close))
-                        continue
+                current_qty = float(pos.get('contracts', 0))
+                if current_qty > 0:
+                    # Positive proof the prior close filled; the remaining size
+                    # is a NEW close intent on a smaller position — a fresh key
+                    # is safe here (never a double-close of the same contracts).
+                    log_execution(
+                        f"[CLOSE] Position still has qty {current_qty:.6f} "
+                        f"after verified fill; closing the remainder",
+                        "WARN")
+                    qty_to_close = current_qty
+                    qty_precise = float(ex.amount_to_precision(sym, qty_to_close))
+                    close_cid = (_close_client_order_id(symbol) + "_R")[:40]
+                    continue
             else:
-                log_execution(f"[CLOSE] Order did not fill (attempt {attempt+1})", "ERROR")
-                time.sleep(1)
-                continue
+                # CONFIRM TIMEOUT: the close may have executed and we cannot
+                # distinguish. Reconcile by clientOrderId + position FIRST.
+                log_execution(
+                    f"[CLOSE] Confirm TIMEOUT for {close_cid} - reconciling, "
+                    f"no blind retry", "WARN")
+                if _reconcile_close_timeout(symbol, STATE["side"], close_cid,
+                                            qty_precise, expected=0):
+                    log_execution(
+                        "[CLOSE] Recovery proved the close landed; adopting", "INFO")
+                    STATE["open"] = False
+                    TRADE_STATE["in_position"] = False
+                    DASHBOARD_STATE["live_trade_mode"] = False
+                    finalize_trade_with_reality(symbol)
+                    return True
+                log_execution(
+                    f"[CLOSE] Close stays UNKNOWN for {close_cid}; leaving for "
+                    f"restart reconciliation (no blind retry)", "WARN")
+                STATE["position_status"] = "UNKNOWN"
+                STATE["sync_status"] = "CLOSE_UNKNOWN"
+                return False
 
-        log_execution("[CLOSE] All close attempts failed. Attempting emergency close via position close.", "ERROR")
+        log_execution("[CLOSE] All close attempts rejected. Emergency re-attempt.", "ERROR")
         try:
-            order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"positionSide": _hedge_position_side(STATE["side"])})
+            order = safe_api_call(ex.create_order, sym, "market", side,
+                                  qty_precise,
+                                  params={"positionSide": _hedge_position_side(STATE["side"]),
+                                          "clientOrderId": close_cid})
             if order:
                 time.sleep(2)
                 pos = fetch_position(symbol)
@@ -4986,7 +5166,8 @@ class LiveTradeManager:
                 trade_state=trade_state,
                 continuation_probability=continuation_eval.continuation_probability
             )
-            if action == "EXIT" and state_ppe.get("smart_money", {}).get("distribution_risk", 0) > 65 and momentum.get("momentum_decay", False):
+            if action == "EXIT" and state_ppe.get("smart_money", {}).get("distribution_risk", 0) > 65 and momentum.get("momentum_decay", False) \
+                    and ((roe or 0) <= 0.0 or (roe or 0) >= PROFIT_LOCK_MIN_ROE):
                 log_execution("[PPE] Institutional exit signal – closing position", "WARN")
                 STATE["close_reason"] = STATE.get("close_reason") or "PROFIT_ENGINE_EXIT"
                 close_position_full()
@@ -6678,7 +6859,7 @@ def _position_status_unknown(symbol, source):
     )
 
 
-# ---- P0-3: exchange-native protective STOP_MARKET reduceOnly SL ------------
+# ---- P0-3: exchange-native protective STOP_MARKET SL (Hedge Mode positionSide) ----
 def _native_sl_delta(current, target):
     try:
         return abs(float(current or 0.0) - float(target or 0.0))
@@ -6687,7 +6868,7 @@ def _native_sl_delta(current, target):
 
 
 def place_native_sl(symbol=None):
-    """Place the single native protective STOP_MARKET reduceOnly SL for the
+    """Place the single native protective STOP_MARKET SL for the
     active position. Idempotent: if an ACTIVE native SL exists we do nothing
     (no duplicate protection). In PAPER_MODE the order is mocked/registered and
     journaled exactly like the live path. Never raises."""
@@ -6709,7 +6890,8 @@ def place_native_sl(symbol=None):
             STATE["native_sl_state"] = "ACTIVE"
             _journal_trade_event(
                 _tj.NATIVE_SL_PLACED, symbol=symbol, side=side,
-                reason=f"paper native STOP_MARKET reduceOnly @ {sl_price:.4f} qty={qty:.6f}",
+                reason=f"paper native STOP_MARKET @ {sl_price:.4f} qty={qty:.6f} "
+                       f"(Hedge positionSide={_hedge_position_side(side)})",
                 state=STATE, level="INFO",
                 metadata={"order_id": order_id, "sl_price": sl_price,
                           "price": sl_price, "mode": "PAPER"},
@@ -6731,7 +6913,8 @@ def place_native_sl(symbol=None):
         STATE["native_sl_state"] = "ACTIVE"
         _journal_trade_event(
             _tj.NATIVE_SL_PLACED, symbol=symbol, side=side,
-            reason=f"native STOP_MARKET reduceOnly @ {sl_price:.4f} qty={qty:.6f}",
+            reason=f"native STOP_MARKET @ {sl_price:.4f} qty={qty:.6f} "
+            f"(Hedge positionSide={_hedge_position_side(side)})",
             state=STATE, level="INFO",
             metadata={"order_id": order_id, "sl_price": sl_price, "mode": "LIVE"},
         )
@@ -7067,24 +7250,105 @@ class OrderManager:
 _order_manager = OrderManager(ex, max_retries=3, retry_delay=1.0, confirm_timeout=15.0)
 
 
+def _synthetic_filled_from_order(order, symbol, direction, client_order_id, desired):
+    """Build a synthetic filled-order record from an order returned by the
+    exchange (used during timeout reconciliation). Returns None when the order
+    does not prove a fill for the requested direction."""
+    try:
+        status = str(order.get("status", "") or "").lower()
+        sym = normalize_symbol(symbol)
+        if status not in ("closed", "filled", "filling", "new", "partially_filled"):
+            return None
+        side = str(order.get("side", "") or "").lower()
+        if side not in ("buy", "sell"):
+            return None
+        order_dir = "long" if side == "buy" else "short"
+        if order_dir != desired:
+            return None
+        filled = float(order.get("filled", 0) or 0)
+        amount = float(order.get("amount", 0) or 0)
+        confirmed = filled if filled > 0 else amount
+        if confirmed <= 0:
+            return None
+        avg = float(order.get("average", 0) or 0)
+        avg = avg if avg > 0 else float(order.get("price", 0) or 0)
+        cid_from_order = order.get("clientOrderId") or ""
+        if cid_from_order and client_order_id and cid_from_order != client_order_id:
+            return None
+        return {
+            "id": order.get("id") or client_order_id,
+            "clientOrderId": client_order_id,
+            "symbol": sym,
+            "side": str(direction).lower(),
+            "type": "market",
+            "status": "closed",
+            "filled": confirmed,
+            "amount": confirmed,
+            "average": avg,
+            "price": avg,
+            "entryPrice": avg,
+            "timestamp": int(float(order.get("timestamp", time.time() * 1000) or time.time() * 1000)),
+            "leverage": float(order.get("leverage", 0) or 0),
+            "recovered": True,
+            "positionSide": _hedge_position_side(direction),
+            "source": "clientOrderId",
+        }
+    except Exception:
+        return None
+
+
 def reconcile_open_after_timeout(symbol, direction, client_order_id, retries=2):
     """Timeout-reconciliation for an OPEN order (BingX Hedge Mode).
 
     A create_order that may have executed but whose confirmation fetch timed out
-    must NEVER be treated as a rejection and NEVER be blindly retried. The
-    exchange's real position is the source of truth: fetch_positions is matched
-    against the requested hedge side (LONG for BUY, SHORT for SELL — NEVER BOTH
-    and never one-way forced). If a matching position with nonzero contracts
-    exists, the original order is treated as FILLED/ACCEPTED and a synthetic
-    filled-order record is returned so the caller converges into the exact same
-    post-fill lifecycle as a normally confirmed order. Returns None when no
-    matching position exists (order stays UNKNOWN; the open may only be retried
-    after reconciliation proves no fill).
+    must NEVER be treated as a rejection and NEVER be blindly retried. Lookup
+    order:
+      1. clientOrderId-first: fetch_order with the exact idempotency key. If the
+         venue answers with a filled/active order for OUR clientOrderId and the
+         correct direction, the original order is proven FILLED.
+      2. position-scan fallback: fetch_positions matched against the requested
+         hedge side (LONG for BUY, SHORT for SELL — NEVER BOTH and never one-way
+         forced). If a matching position with nonzero contracts exists the order
+         is treated as FILLED and a synthetic record is returned.
+    Returns None when neither lookup proves a fill (order stays UNKNOWN; the
+    open may only be retried after reconciliation proves no fill).
     """
     desired = "long" if str(direction).upper() in ("BUY", "LONG") else "short"
     sym = normalize_symbol(symbol)
     last_err = None
     for attempt in range(max(1, retries)):
+        # 1) Exact idempotency-key lookup first (cheapest, most specific).
+        if client_order_id:
+            try:
+                order = safe_api_call(
+                    ex.fetch_order, client_order_id, sym,
+                    params={"clientOrderId": client_order_id})
+                if order is not None:
+                    recovered = _synthetic_filled_from_order(
+                        order, sym, direction, client_order_id, desired)
+                    if recovered is not None:
+                        return recovered
+            except Exception as oid_err:
+                last_err = oid_err
+            # Some venues do not resolve clientOrderId via fetch_order — scan
+            # the recent/open order list for our exact idempotency key instead.
+            try:
+                orders = None
+                if hasattr(ex, "fetch_orders"):
+                    orders = safe_api_call(ex.fetch_orders, [sym])
+                if (orders is None or not orders) and hasattr(ex, "fetch_open_orders"):
+                    orders = safe_api_call(ex.fetch_open_orders, [sym])
+                if orders:
+                    for order in orders:
+                        cid = str(order.get("clientOrderId") or "").strip()
+                        if cid and cid == client_order_id:
+                            recovered = _synthetic_filled_from_order(
+                                order, sym, direction, client_order_id, desired)
+                            if recovered is not None:
+                                return recovered
+            except Exception as list_err:
+                last_err = list_err
+        # 2) Position-scan fallback (venue of record for actual fill evidence).
         try:
             positions = None
             if hasattr(ex, "fetch_positions"):
@@ -7120,6 +7384,7 @@ def reconcile_open_after_timeout(symbol, direction, client_order_id, retries=2):
                         "leverage": leverage,
                         "recovered": True,
                         "positionSide": _hedge_position_side(direction),
+                        "source": "position_scan",
                     }
             return None
         except Exception as e:
@@ -7237,7 +7502,7 @@ def close_position(amount, symbol):
         order = safe_api_call(ex.create_order, sym, "market", close_side, amount, params={"positionSide": _hedge_position_side(side)})
         with _TRADE_LOCK:
             _ACTIVE_TRADE = False
-        log_execution(f"[CLOSE] Closed {amount} {symbol} (reduceOnly)", "SUCCESS")
+        log_execution(f"[CLOSE] Closed {amount} {symbol} (Hedge positionSide)", "SUCCESS")
         return order
     except Exception as e:
         log_execution(f"[CLOSE] Close position error: {traceback.format_exc()}", "ERROR")

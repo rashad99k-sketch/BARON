@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import sys
 import types
+import importlib.util
 import hashlib
 import time
 import unittest
@@ -32,7 +33,10 @@ import pandas as pd
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-os.environ.update({
+# Applied deterministically to EVERY test of this module (setUpClass) and
+# restored afterwards, so the shared-process environment is never mutilated
+# at import time for other modules.
+ENGINE_ENV = {
     "PAPER_MODE": "True",
     "NEWS_ENABLED": "False",
     "USE_EXECUTION_QUEUE": "True",
@@ -45,7 +49,7 @@ os.environ.update({
     "RADAR_MAX_CALLS_PER_MIN": "100000",
     "QUEUE_MAX_SIZE": "16",
     "TRIGGER_EVENT_WINDOW_BARS": "3",
-})
+}
 
 
 class _FakeFlask:
@@ -80,10 +84,22 @@ def _load_engine():
     sys.modules["ccxt"] = fake_ccxt
     sys.modules["flask"] = fake_flask
     for name in list(sys.modules):
-        if name == "core.engine" or name.startswith("scanner."):
+        if name.startswith("scanner."):
             sys.modules.pop(name, None)
-    sys.modules.pop("core.engine", None)
-    engine = __import__("core.engine", fromlist=["core"])
+    # Re-execute the engine under a PRIVATE name so the shared core.engine
+    # identity (bound by portfolio.manager and the live-brain harnesses) is
+    # never evicted / orphaned mid-suite.
+    orig_engine = saved["core.engine"]
+    if orig_engine is not None:
+        spec = importlib.util.spec_from_file_location("_readypath_fresh_engine", orig_engine.__file__)
+        engine = importlib.util.module_from_spec(spec)
+        sys.modules["_readypath_fresh_engine"] = engine
+        try:
+            spec.loader.exec_module(engine)
+        finally:
+            sys.modules.pop("_readypath_fresh_engine", None)
+    else:
+        engine = __import__("core.engine", fromlist=["core"])
     return engine, saved, old_paper
 
 
@@ -95,13 +111,14 @@ def _seed_of(symbol: str) -> float:
 class ReadypathDeterministicDrill(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls._saved_env = {k: os.environ.get(k) for k in ENGINE_ENV}
+        os.environ.update(ENGINE_ENV)
         cls.engine, cls.saved, cls.old_paper = _load_engine()
         cls.E = cls.engine
         cls.dq = cls.E.ExecutionQueue(max_size=16)
 
     @classmethod
     def tearDownClass(cls):
-        sys.modules.pop("core.engine", None)
         for name, module in cls.saved.items():
             if module is None:
                 sys.modules.pop(name, None)
@@ -109,6 +126,11 @@ class ReadypathDeterministicDrill(unittest.TestCase):
                 sys.modules[name] = module
         if cls.old_paper is not None:
             os.environ["PAPER_MODE"] = cls.old_paper
+        for k, saved in cls._saved_env.items():
+            if saved is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = saved
 
     def setUp(self):
         # Fast-path zone gate caches under the REAL per-symbol key (forensic

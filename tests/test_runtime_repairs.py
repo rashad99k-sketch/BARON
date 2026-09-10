@@ -84,15 +84,18 @@ class ZoneAnalysisRealTest(unittest.TestCase):
         import sys
         # Other test modules may reload core.engine into a fresh module object.
         # Re-establish a consistent engine/module state before re-importing
-        # scanner: reload core.engine and re-attach it to the parent package.
-        sys.modules.pop("core.engine", None)
-        eng = importlib.import_module("core.engine")
-        import core as _core_pkg
-        _core_pkg.engine = eng
+        # scanner: reload core.engine (under a snapshot) and re-attach it to the
+        # parent package, then RESTORE the shared core.engine identity so later
+        # tests are never orphaned.
+        prev_engine = sys.modules.get("core.engine")
         prev_scanner = sys.modules.pop("scanner", None)
         prev_sub = sys.modules.pop("scanner.scanner", None)
+        sys.modules.pop("core.engine", None)
         importlib.invalidate_caches()
         try:
+            eng = importlib.import_module("core.engine")
+            import core as _core_pkg
+            _core_pkg.engine = eng
             import scanner.scanner as S
             self.assertIs(S.compute_zone_strength, eng.compute_zone_strength)
             self.assertIs(S.get_smart_zones, eng.get_smart_zones)
@@ -103,6 +106,8 @@ class ZoneAnalysisRealTest(unittest.TestCase):
                 sys.modules["scanner"] = prev_scanner
             if prev_sub is not None:
                 sys.modules["scanner.scanner"] = prev_sub
+            if prev_engine is not None:
+                sys.modules["core.engine"] = prev_engine
 
     def test_engine_has_no_undefined_zone_names(self):
         # Fail loudly if anyone reintroduces a reference without a definition.

@@ -233,6 +233,13 @@ class RadarPositionLifecycleTest(unittest.TestCase):
                     "compute_atr", "compute_adx", "get_smart_zones",
                     "detect_market_regime")
 
+    @classmethod
+    def setUpClass(cls):
+        try:
+            exec(compile(E.__loader__.get_source("core.engine"), E.__file__, "exec"), vars(E))
+        except Exception:  # pragma: no cover - defensive
+            pass
+
     def setUp(self):
         self._saved = {n: getattr(E, n) for n in self._model_names}
         self._saved_prov = (E.get_ohlcv_safe, E.get_ticker_safe,

@@ -10,6 +10,7 @@ Proves through real production code paths that:
      the browser never receives undefined literals.
 """
 import importlib
+import importlib.util
 import os
 import sys
 import types
@@ -46,9 +47,20 @@ def _load_engine():
     fake_flask.request = types.SimpleNamespace()
     sys.modules["ccxt"] = fake_ccxt
     sys.modules["flask"] = fake_flask
-    sys.modules.pop("core.engine", None)
     try:
-        engine = importlib.import_module("core.engine")
+        # Re-execute the engine under a private name so `core.engine` keeps its
+        # canonical identity (bound by portfolio.manager and the brain harnesses)
+        # for the rest of the suite.
+        if saved_engine is not None:
+            spec = importlib.util.spec_from_file_location("_schema_fresh_engine", saved_engine.__file__)
+            engine = importlib.util.module_from_spec(spec)
+            sys.modules["_schema_fresh_engine"] = engine
+            try:
+                spec.loader.exec_module(engine)
+            finally:
+                sys.modules.pop("_schema_fresh_engine", None)
+        else:
+            engine = importlib.import_module("core.engine")
         return engine
     finally:
         os.environ.clear()
@@ -224,7 +236,9 @@ class DashboardNormalizeTest(unittest.TestCase):
             fake_flask.request = types.SimpleNamespace()
             sys.modules["ccxt"] = fake_ccxt
             sys.modules["flask"] = fake_flask
-            sys.modules.pop("core.engine", None)
+            # core.engine intentionally NOT evicted here: a fresh re-import
+            # mid-suite orphans every module that already holds `import
+            # core.engine` (dashboard.app can import the canonical engine fine).
             sys.modules.pop("dashboard.app", None)
             dash = importlib.import_module("dashboard.app")
         finally:

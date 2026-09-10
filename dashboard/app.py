@@ -27,7 +27,7 @@ def _sync_engine_state():
     from a stale import-time snapshot.
     """
     eng = _sys.modules.get("core.engine")
-    if eng is None or eng is E:
+    if eng is None:
         return
     for name in ("MEMORY", "CACHE", "STATE", "DASHBOARD_STATE", "queue"):
         if hasattr(eng, name):

@@ -323,7 +323,14 @@ class NewsRegimeAndIsolationTest(unittest.TestCase, NewsHarnessMixin):
 
 
 class NewsSlotGateTest(unittest.TestCase, NewsHarnessMixin):
-    """Requirement: NEWS_SLOT_ENABLED=false -> no trade; =true -> full path."""
+    """Requirement: NEWS_SLOT_ENABLED=false -> no trade; =true -> full path.
+
+    The gate exercises the full open path against engine state emitted by
+    earlier files in the same pytest process (its pass/fail result is
+    order-sensitive). It therefore runs through the subprocess worker in
+    `test_news_slot_gate_isolated.py` and is not collected here."""
+
+    __test__ = False
 
     def setUp(self):
         NewsHarnessMixin.setUp(self)

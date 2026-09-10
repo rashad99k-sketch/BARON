@@ -1,4 +1,5 @@
 import importlib
+import importlib.util
 import os
 import sys
 import types
@@ -17,15 +18,28 @@ def _load():
         def __init__(self,*a,**k): self.markets={}
     ccxt.bingx=FakeBingX
     flask=types.ModuleType('flask'); flask.Flask=_FakeFlask; flask.jsonify=lambda *a,**k:None; flask.request=types.SimpleNamespace()
-    sys.modules['ccxt']=ccxt; sys.modules['flask']=flask; sys.modules.pop('core.engine',None)
-    return importlib.import_module('core.engine'),saved,old
+    sys.modules['ccxt']=ccxt; sys.modules['flask']=flask
+    # Re-execute the engine under a PRIVATE name so the shared core.engine
+    # identity (bound by portfolio.manager and the live-brain harnesses) is
+    # never evicted / orphaned mid-suite.
+    orig=sys.modules.get('core.engine')
+    if orig is not None:
+        spec=importlib.util.spec_from_file_location('_early_queue_fresh_engine', orig.__file__)
+        engine=importlib.util.module_from_spec(spec)
+        sys.modules['_early_queue_fresh_engine']=engine
+        try:
+            spec.loader.exec_module(engine)
+        finally:
+            sys.modules.pop('_early_queue_fresh_engine',None)
+    else:
+        engine=importlib.import_module('core.engine')
+    return engine,saved,old
 
 class EarlyPreparedQueueTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls): cls.E,cls.saved,cls.old=_load()
     @classmethod
     def tearDownClass(cls):
-        sys.modules.pop('core.engine',None)
         for k,v in cls.saved.items():
             if v is None: sys.modules.pop(k,None)
             else: sys.modules[k]=v

@@ -20,6 +20,7 @@ Locks in, through the real ExecutionQueue methods:
  16. The NEWS slot admits at most one independent news trade.
 """
 import importlib
+import importlib.util
 import os
 import sys
 import types
@@ -55,8 +56,18 @@ def _load_engine():
     fake_flask.request = types.SimpleNamespace()
     sys.modules["ccxt"] = fake_ccxt
     sys.modules["flask"] = fake_flask
-    sys.modules.pop("core.engine", None)
-    engine = importlib.import_module("core.engine")
+    # Re-execute the engine code IN PLACE on the shared module object so the
+    # canonical core.engine identity is preserved (bound by portfolio.manager,
+    # scanner/strategy/news harnesses, and every later test), while its state is
+    # at the same time reset to pristine module-import state.
+    orig_engine = saved["core.engine"]
+    if orig_engine is not None:
+        with open(orig_engine.__file__, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        exec(compile(src, orig_engine.__file__, "exec"), vars(orig_engine))
+        engine = orig_engine
+    else:
+        engine = importlib.import_module("core.engine")
     return engine, saved, old_paper
 
 
@@ -134,7 +145,6 @@ class ForensicFixesTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        sys.modules.pop("core.engine", None)
         for name, module in cls.saved.items():
             if module is None:
                 sys.modules.pop(name, None)

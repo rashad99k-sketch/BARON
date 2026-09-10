@@ -12,6 +12,7 @@ Proves, through the REAL production code paths:
   5. The dashboard payload carries the pipeline funnel + gate statistics.
 """
 import importlib
+import importlib.util
 import os
 import sys
 import types
@@ -46,8 +47,22 @@ def _load_engine():
     fake_flask.request = types.SimpleNamespace()
     sys.modules["ccxt"] = fake_ccxt
     sys.modules["flask"] = fake_flask
-    sys.modules.pop("core.engine", None)
-    engine = importlib.import_module("core.engine")
+    # Re-execute the engine code IN PLACE on the shared module object so the
+    # canonical core.engine identity is preserved (bound by portfolio.manager,
+    # scanner/strategy/news harnesses, and every later test), while its state is
+    # at the same time reset to pristine module-import state.
+    orig_engine = saved["core.engine"]
+    if orig_engine is not None:
+        with open(orig_engine.__file__, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        exec(compile(src, orig_engine.__file__, "exec"), vars(orig_engine))
+        engine = orig_engine
+        # drop the dashboard.app copy so it re-binds the freshly re-executed
+        # engine globals (its module-level globals().update(vars(E)) snapshot
+        # otherwise points at the pre-re-exec MEMORY dict object).
+        sys.modules.pop("dashboard.app", None)
+    else:
+        engine = importlib.import_module("core.engine")
     return engine, saved, old_paper
 
 
@@ -125,7 +140,6 @@ class PromotionWindowTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        sys.modules.pop("core.engine", None)
         for name, module in cls.saved.items():
             if module is None:
                 sys.modules.pop(name, None)
@@ -250,7 +264,6 @@ class ReadyTransitionTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        sys.modules.pop("core.engine", None)
         for name, module in cls.saved.items():
             if module is None:
                 sys.modules.pop(name, None)
@@ -370,6 +383,7 @@ class DashboardPipelineTest(unittest.TestCase):
             "radar": {"attempted": 20, "scanned": 18},
         }
         try:
+            sys.modules.pop("dashboard.app", None)
             dashboard = importlib.import_module("dashboard.app")
             if not hasattr(dashboard.app, "test_client"):
                 self.skipTest("dashboard app not available under fake-flask harness")
@@ -418,7 +432,6 @@ class InstitutionalZoneSeparationTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        sys.modules.pop("core.engine", None)
         for name, module in cls.saved.items():
             if module is None:
                 sys.modules.pop(name, None)

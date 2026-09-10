@@ -26,7 +26,7 @@ Canonical event vocabulary (stage="TRADE", decision=<event>):
   TP2_EXECUTED              runner banked at the second target (full close)
   TRADE_CLOSED              final trade summary, classified from REALIZED PnL
   EXTERNAL_CLOSE            position confirmed closed on the exchange
-  NATIVE_SL_PLACED          exchange-native STOP_MARKET reduceOnly PLACED
+  NATIVE_SL_PLACED          exchange-native STOP_MARKET PLACED (Hedge positionSide)
   NATIVE_SL_UPDATED         exchange-native protective SL UPDATED (monotonic)
   NATIVE_SL_CANCELLED       exchange-native protective SL CANCELLED (best effort)
   NATIVE_SL_FAILED          exchange-native protective SL could not be placed

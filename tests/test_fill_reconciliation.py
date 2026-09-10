@@ -10,6 +10,7 @@ Proves through the real production code paths that:
   5. Adoption of a position with zero levels still yields valid defaults.
 """
 import importlib
+import importlib.util
 import os
 import sys
 import types
@@ -45,9 +46,22 @@ def _load_engine():
     fake_flask.request = types.SimpleNamespace()
     sys.modules["ccxt"] = fake_ccxt
     sys.modules["flask"] = fake_flask
-    sys.modules.pop("core.engine", None)
+    # Re-execute the engine under a PRIVATE name so the shared core.engine
+    # identity (bound by portfolio.manager and the live-brain harnesses) is
+    # never evicted / orphaned mid-suite.
     try:
-        engine = importlib.import_module("core.engine")
+        orig_engine = sys.modules.get("core.engine")
+        if orig_engine is not None:
+            spec = importlib.util.spec_from_file_location(
+                "_fill_recon_fresh_engine", orig_engine.__file__)
+            engine = importlib.util.module_from_spec(spec)
+            sys.modules["_fill_recon_fresh_engine"] = engine
+            try:
+                spec.loader.exec_module(engine)
+            finally:
+                sys.modules.pop("_fill_recon_fresh_engine", None)
+        else:
+            engine = importlib.import_module("core.engine")
         return engine, saved_ccxt, saved_flask
     finally:
         os.environ.clear()
@@ -61,7 +75,6 @@ class FillReconciliationTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        sys.modules.pop("core.engine", None)
         for name, module in (("ccxt", cls.saved_ccxt), ("flask", cls.saved_flask)):
             if module is None:
                 sys.modules.pop(name, None)

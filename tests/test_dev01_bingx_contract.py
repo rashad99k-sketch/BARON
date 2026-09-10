@@ -134,6 +134,16 @@ class _FakeVenue:
         return dict(params or {})
 
 
+def _reset_dashboard():
+    """Restore the DASHBOARD_STATE keys log_execution() touches so later tests
+    (in any module order) never hit KeyError when an ERROR path logs."""
+    E.DASHBOARD_STATE.clear()
+    E.DASHBOARD_STATE.update({"logs": [], "errors": [],
+                              "live_trade_mode": False,
+                              "lifecycle_state": "IDLE",
+                              "position": None})
+
+
 class _CaptureHarness(unittest.TestCase):
     """Base: runs the REAL close functions in their LIVE branch and captures."""
 
@@ -174,7 +184,7 @@ class _CaptureHarness(unittest.TestCase):
         E._reconciliation_pending = False
         E.STATE.clear()
         E.TRADE_STATE.clear()
-        E.DASHBOARD_STATE.clear()
+        _reset_dashboard()
         E.paper.update({"balance": 10000.0, "position": None, "committed_margin": 0.0})
         E.PERF.update({"trades": 0, "wins": 0, "losses": 0, "total_pnl_usdt": 0.0,
                        "total_pnl_pct": 0.0, "last_trade": {}})
@@ -555,8 +565,7 @@ class PaperCloseSemanticsTest(unittest.TestCase):
         E._reconciliation_pending = False
         E.STATE.clear()
         E.TRADE_STATE.clear()
-        E.DASHBOARD_STATE.clear()
-        E.DASHBOARD_STATE["logs"] = []
+        _reset_dashboard()
         E.paper.update({"balance": 10000.0, "position": {}, "committed_margin": 1000.0})
         E.MEMORY.clear()
         E.MEMORY.update(copy.deepcopy(_MEMORY_BASE))
@@ -573,8 +582,7 @@ class PaperCloseSemanticsTest(unittest.TestCase):
         # shared state after every test so nothing leaks across files.
         E.STATE.clear()
         E.TRADE_STATE.clear()
-        E.DASHBOARD_STATE.clear()
-        E.DASHBOARD_STATE["logs"] = []
+        _reset_dashboard()
         E.paper.update({"balance": 10000.0, "position": None, "committed_margin": 0.0})
         E._closing_in_progress = False
         E._reconciliation_pending = False

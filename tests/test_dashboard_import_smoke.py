@@ -1,4 +1,5 @@
 import importlib
+import importlib.util
 import sys
 import types
 import unittest
@@ -27,11 +28,28 @@ class DashboardImportSmokeTest(unittest.TestCase):
         sys.modules["ccxt"] = fake_ccxt
         sys.modules["flask"] = fake_flask
         try:
-            for name in ("dashboard.app", "scanner.scanner", "core.engine"):
-                sys.modules.pop(name, None)
-            module = importlib.import_module("dashboard.app")
+            # MUST NOT evict core.engine: re-importing it under a fresh
+            # identity mid-suite permanently orphans every module that already
+            # holds `import core.engine` (portfolio.manager and the live-brain
+            # harnesses), which then manages a STATE nobody mirrors. Instead we
+            # fresh-execute dashboard.app under a PRIVATE module name and assert
+            # the structural contract it must satisfy to be loadable at all.
+            module_path = importlib.util.find_spec("dashboard.app").origin
+            aspec = importlib.util.spec_from_file_location("_dash_smoke_app", module_path)
+            module = importlib.util.module_from_spec(aspec)
+            sys.modules["_dash_smoke_app"] = module
+            try:
+                aspec.loader.exec_module(module)
+            finally:
+                sys.modules.pop("_dash_smoke_app", None)
             self.assertTrue(hasattr(module, "app"))
-            self.assertIsInstance(module.app, _FakeFlask)
+            self.assertTrue(callable(module.app.route))
+            self.assertTrue(callable(module.app.add_url_rule))
+            # The engine-bound copies prove the core.engine wiring survived the
+            # dependency stubs (this is what the smoke test actually guards).
+            self.assertTrue(hasattr(module, "resolve_exchange_symbol"))
+            self.assertEqual(
+                module.resolve_exchange_symbol("AAPL/USDT"), "AAPL/USDT:USDT")
         finally:
             for name, mod in saved.items():
                 if mod is None:

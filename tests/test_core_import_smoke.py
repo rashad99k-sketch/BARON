@@ -1,4 +1,5 @@
 import importlib
+import importlib.util
 import sys
 import types
 import unittest
@@ -33,15 +34,27 @@ class CoreImportSmokeTest(unittest.TestCase):
         fake_flask.request = types.SimpleNamespace()
         sys.modules["ccxt"] = fake_ccxt
         sys.modules["flask"] = fake_flask
+        orig_engine = sys.modules.get("core.engine")
         try:
-            sys.modules.pop("core.engine", None)
-            module = importlib.import_module("core.engine")
+            if orig_engine is not None:
+                # Re-execute the engine under a private name so the shared
+                # core.engine identity (bound by portfolio/manager and the
+                # live-brain harnesses) is never evicted mid-suite.
+                spec = importlib.util.spec_from_file_location(
+                    "_import_smoke_fresh", orig_engine.__file__)
+                module = importlib.util.module_from_spec(spec)
+                sys.modules["_import_smoke_fresh"] = module
+                try:
+                    spec.loader.exec_module(module)
+                finally:
+                    sys.modules.pop("_import_smoke_fresh", None)
+            else:
+                module = importlib.import_module("core.engine")
             self.assertTrue(hasattr(module, "resolve_exchange_symbol"))
             self.assertTrue(hasattr(module, "execute_entry"))
             self.assertEqual(module.resolve_exchange_symbol("AAPL/USDT"), "AAPL/USDT:USDT")
             self.assertEqual(module.resolve_exchange_symbol("GOLD(XAU)/USDT"), "GOLD(XAU)/USDT:USDT")
         finally:
-            sys.modules.pop("core.engine", None)
             if saved_ccxt is not None:
                 sys.modules["ccxt"] = saved_ccxt
             else:

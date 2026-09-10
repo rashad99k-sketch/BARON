@@ -1,1 +1,2 @@
-from .manager import PortfolioManager, PositionContext
+from .manager import PortfolioManager
+from .manager import _LegacyContext as PositionContext

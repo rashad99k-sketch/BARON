@@ -1,4 +1,9 @@
-"""Runtime orchestration, exchange reconciliation and portfolio supervision."""
+"""Runtime orchestration, exchange reconciliation and portfolio supervision.
+
+v2: Routes all trade operations through TradeExecutionCoordinator.
+The coordinator is the single authority for open/close/modify.
+Risk guard reads from the coordinator's immutable closure log.
+"""
 from __future__ import annotations
 
 import os
@@ -11,6 +16,7 @@ import core.engine as E
 import scanner.scanner as S
 from portfolio.manager import PortfolioManager
 from portfolio.allocator import GlobalAssetAllocator
+from portfolio.coordinator import TradeExecutionCoordinator
 from scanner.deep_scanner import DeepScanner
 
 # Compatibility exports: legacy modules still call these names through E.
@@ -19,6 +25,7 @@ globals().update({k: v for k, v in vars(S).items() if not k.startswith("__")})
 
 MAX_OPEN_POSITIONS = max(1, int(os.getenv("MAX_OPEN_POSITIONS", "6")))
 PORTFOLIO = PortfolioManager(MAX_OPEN_POSITIONS, E)
+COORDINATOR = PORTFOLIO.coordinator  # Single execution authority
 ALLOCATOR = GlobalAssetAllocator(PORTFOLIO, E)
 DEEP_SCANNER = DeepScanner()
 
@@ -456,9 +463,11 @@ def portfolio_loop(dashboard_module=None):
     last_watch_service = 0.0
     last_snapshot = 0.0
     last_queue_eval = 0.0
+    last_reconciliation = 0.0
     discovery_interval = float(os.getenv("GLOBAL_SCAN_INTERVAL_SEC", "900"))
     watch_interval = float(os.getenv("WATCHLIST_SERVICE_INTERVAL_SEC", "20"))
     snapshot_interval = float(os.getenv("SNAPSHOT_INTERVAL", "60"))
+    reconciliation_interval = float(os.getenv("RECONCILIATION_INTERVAL", "30"))
 
     try:
         ex.load_markets()
@@ -472,52 +481,66 @@ def portfolio_loop(dashboard_module=None):
         try:
             now = time.time()
 
-            # Existing positions are serviced first.
+            # 1. Manage existing positions via TradeCouncil (no activate/deactivate)
             if PORTFOLIO.count():
                 PORTFOLIO.manage_all()
 
-            # Scanner/queue work runs outside any active portfolio context.
-            PORTFOLIO.activate(None)
-            try:
-                if now - last_discovery >= discovery_interval:
-                    _run_discovery()
-                    last_discovery = now
+            # 2. Reconcile pending intents (idempotency safety net)
+            if now - last_reconciliation >= reconciliation_interval:
+                try:
+                    def exchange_fetcher(symbol):
+                        return sync_position_with_exchange(symbol)
+                    reconciled = COORDINATOR.reconcile_pending(exchange_fetcher)
+                    if reconciled:
+                        for trade in reconciled:
+                            PORTFOLIO._trades[trade.trade_id] = trade
+                        PORTFOLIO._sync_legacy_contexts()
+                        log_execution(
+                            f"[COORDINATOR] Reconciled {len(reconciled)} pending trade(s)",
+                            "INFO",
+                        )
+                    last_reconciliation = now
+                except Exception as exc:
+                    log_execution(f"[COORDINATOR] reconciliation error: {exc}", "WARN")
 
-                if now - last_watch_service >= watch_interval:
-                    _service_watchlist_and_queue()
-                    last_watch_service = now
+            # 3. Discovery, watchlist, queue work
+            if now - last_discovery >= discovery_interval:
+                _run_discovery()
+                last_discovery = now
 
-                # Queue is re-evaluated frequently, but not on every main-loop
-                # tick, to avoid hammering the exchange API.
-                if USE_EXECUTION_QUEUE and now - last_queue_eval >= float(os.getenv("QUEUE_RE_EVAL_INTERVAL", "5")):
-                    try:
-                        queue.re_evaluate_all(lambda sym: get_ohlcv_safe(sym, 100))
-                        MEMORY["queue_last_evaluation"] = time.time()
-                        last_queue_eval = now
-                    except Exception as exc:
-                        log_execution(f"[QUEUE] fast re-evaluation error: {exc}", "WARN")
+            if now - last_watch_service >= watch_interval:
+                _service_watchlist_and_queue()
+                last_watch_service = now
 
-                _execute_ready_queue_candidate()
-                # Independent, opt-in news slot. Runs after the technical path
-                # and never consumes a technical class cap (NEWS asset class).
-                execute_news_slot()
-                if USE_EXECUTION_QUEUE:
-                    queue.cleanup()
-                    MEMORY["queue_status"] = queue.get_status()
+            # 4. Queue re-evaluation
+            if USE_EXECUTION_QUEUE and now - last_queue_eval >= float(os.getenv("QUEUE_RE_EVAL_INTERVAL", "5")):
+                try:
+                    queue.re_evaluate_all(lambda sym: get_ohlcv_safe(sym, 100))
+                    MEMORY["queue_last_evaluation"] = time.time()
+                    last_queue_eval = now
+                except Exception as exc:
+                    log_execution(f"[QUEUE] fast re-evaluation error: {exc}", "WARN")
 
-                # Keep the institutional flow panel alive independently.
-                if now - MEMORY.get("last_flow_update", 0) >= 60:
-                    try:
-                        update_institutional_flow_scanner()
-                    except Exception as exc:
-                        log_execution(f"[SCANNER] flow updater: {exc}", "WARN")
-                    MEMORY["last_flow_update"] = now
-            finally:
-                PORTFOLIO.deactivate()
+            # 5. Execute best ready candidate via coordinator
+            _execute_ready_queue_candidate()
+            execute_news_slot()
+            if USE_EXECUTION_QUEUE:
+                queue.cleanup()
+                MEMORY["queue_status"] = queue.get_status()
 
+            # 6. Institutional flow panel
+            if now - MEMORY.get("last_flow_update", 0) >= 60:
+                try:
+                    update_institutional_flow_scanner()
+                except Exception as exc:
+                    log_execution(f"[SCANNER] flow updater: {exc}", "WARN")
+                MEMORY["last_flow_update"] = now
+
+            # 7. Dashboard
             if dashboard_module:
                 _publish_portfolio_dashboard(dashboard_module)
 
+            # 8. Snapshot
             if time.time() - last_snapshot >= snapshot_interval:
                 try:
                     if dashboard_module and hasattr(dashboard_module, "print_snapshot"):

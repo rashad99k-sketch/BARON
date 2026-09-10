@@ -452,6 +452,13 @@ class IfvgSixPositionLifecycleStressTest(unittest.TestCase):
     violated hard, per-symbol isolation holds, and the free+committed margin
     invariant reconciles exactly (same accounting as the 6-way suite)."""
 
+    @classmethod
+    def setUpClass(cls):
+        try:
+            exec(compile(E.__loader__.get_source("core.engine"), E.__file__, "exec"), vars(E))
+        except Exception:  # pragma: no cover - defensive
+            pass
+
     PAPER_ENV = {
         "PAPER_MODE": "True",
         "BINGX_KEY": "",

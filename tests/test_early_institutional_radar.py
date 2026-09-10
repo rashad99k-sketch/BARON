@@ -179,7 +179,6 @@ class EarlyInstitutionalRadarTest(unittest.TestCase):
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = module
-        sys.modules.pop("core.msb_ob", None)
 
     def setUp(self):
         STATE["calls"] = 0

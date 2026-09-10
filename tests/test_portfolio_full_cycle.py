@@ -93,7 +93,21 @@ def _news_watch(symbol, bias="BULLISH", risk=20.0):
     }
 
 
+def _freshen_engine():
+    """Self-isolate: rebuild the canonical engine in place before the test so
+    engine state is deterministic regardless of which files ran earlier in the
+    pytest process (single-position engine + professional live book)."""
+    try:
+        exec(compile(E.__loader__.get_source("core.engine"), E.__file__, "exec"), vars(E))
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
 class SixSlotFullCycleTest(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        _freshen_engine()
 
     def setUp(self):
         self._saved = (E.get_ohlcv_safe, E.get_ticker_safe,
@@ -224,6 +238,10 @@ class ProfitTakingRealPathTest(unittest.TestCase):
     """Real profit-taking functions used by the runtime book the lifecycle:
     apply_profit_engine (TP1/TP2 partial closes) then
     finalize_trade_with_reality (margin release + realized PnL + reaping)."""
+
+    @classmethod
+    def setUpClass(cls):
+        _freshen_engine()
 
     def setUp(self):
         self._saved = (E.get_ohlcv_safe, E.get_ticker_safe,

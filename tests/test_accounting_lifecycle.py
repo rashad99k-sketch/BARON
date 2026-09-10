@@ -10,6 +10,7 @@ Proves through the real production code paths that:
      credits the remaining leg on top of already-booked partials.
 """
 import importlib
+import importlib.util
 import os
 import sys
 import types
@@ -30,6 +31,7 @@ class _FakeFlask:
 def _load_engine():
     saved_ccxt = sys.modules.get("ccxt")
     saved_flask = sys.modules.get("flask")
+    orig_engine = sys.modules.get("core.engine")
     env = dict(os.environ)
     os.environ.pop("PAPER_MODE", None)
     fake_ccxt = types.ModuleType("ccxt")
@@ -45,9 +47,25 @@ def _load_engine():
     fake_flask.request = types.SimpleNamespace()
     sys.modules["ccxt"] = fake_ccxt
     sys.modules["flask"] = fake_flask
-    sys.modules.pop("core.engine", None)
+    # IMPORTANT: re-execute the engine under a PRIVATE module name so its
+    # module globals (STATE/PERF/paper/live_manager...) are isolated WITHOUT
+    # evicting the shared `core.engine` identity. Every other already-imported
+    # module (`portfolio.manager`, `core.trade`, the live-brain harnesses)
+    # resolves `core.engine` from sys.modules; if we pop it, whichever module
+    # imports it next binds a FRESH engine and the brain writes state that the
+    # position mirrors never see (gap/radar/full-cycle suites fail in isolation
+    # only because of this identity split).
     try:
-        engine = importlib.import_module("core.engine")
+        if orig_engine is None:
+            return importlib.import_module("core.engine"), saved_ccxt, saved_flask
+        _spec = importlib.util.spec_from_file_location(
+            "_accounting_fresh_engine", orig_engine.__file__)
+        engine = importlib.util.module_from_spec(_spec)
+        sys.modules["_accounting_fresh_engine"] = engine
+        try:
+            _spec.loader.exec_module(engine)
+        finally:
+            sys.modules.pop("_accounting_fresh_engine", None)
         return engine, saved_ccxt, saved_flask
     finally:
         os.environ.clear()
@@ -66,7 +84,9 @@ class AccountingLifecycleTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        sys.modules.pop("core.engine", None)
+        # The shared `core.engine` module was NEVER evicted or re-imported
+        # (see _load_engine), so other suites keep the same engine identity.
+        # Only the temporary fake ccxt/flask modules are restored here.
         for name, module in (("ccxt", cls.saved_ccxt), ("flask", cls.saved_flask)):
             if module is None:
                 sys.modules.pop(name, None)
