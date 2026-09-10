@@ -631,6 +631,58 @@ class TestPortfolioRiskGuardV2(unittest.TestCase):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Close clientOrderId uniqueness (BingX permanently burns used IDs,
+# error 101400 "clientOrderID unique check failed" on any reuse)
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestCloseClientOrderId(unittest.TestCase):
+    def setUp(self):
+        import core.engine as engine
+        self._engine = engine
+        self._saved = dict(engine.STATE)
+        engine.STATE["trade_id"] = "TRADE-9fb2c81e4a7d6c3f0a1b2c3d4e5f6789"
+        engine.STATE["entry_time"] = time.time()
+        engine.STATE["current_symbol"] = "BTC/USDT:USDT"
+
+    def tearDown(self):
+        self._engine.STATE.clear()
+        self._engine.STATE.update(self._saved)
+
+    def test_length_and_shape(self):
+        from core.engine import _close_client_order_id
+        for purpose, tag in (("C", "_C_"), ("P", "_P_"), ("R", "_R_"), ("E", "_E_")):
+            cid = _close_client_order_id("BTC/USDT:USDT", purpose=purpose, nonce=1)
+            self.assertLessEqual(len(cid), 40, cid)
+            self.assertTrue(cid.startswith("BARON_"), cid)
+            self.assertIn(tag, cid, cid)
+
+    def test_unique_across_purposes_attempts(self):
+        from core.engine import _close_client_order_id
+        ids = set()
+        for purpose in ("C", "P", "R", "E"):
+            for nonce in range(1, 6):
+                ids.add(_close_client_order_id(
+                    "BTC/USDT:USDT", purpose=purpose, nonce=nonce))
+        self.assertEqual(len(ids), 20, ids)
+
+    def test_unique_across_invocations(self):
+        # The regression: repeated close_position_full calls for the SAME trade
+        # must never reuse one burned id (deterministic ids caused the 101400
+        # loop in production). Auto-nonce must already guarantee freshness.
+        from core.engine import _close_client_order_id
+        ids = {_close_client_order_id("BTC/USDT:USDT") for _ in range(6)}
+        self.assertEqual(len(ids), 6, ids)
+
+    def test_burned_id_detection(self):
+        from core.engine import _close_cid_burned
+        msg = ('bingx {"code":101400,"msg":"clientOrderID unique check '
+               'failed","data":{}}')
+        self.assertTrue(_close_cid_burned(msg))
+        self.assertTrue(_close_cid_burned("unique check failed"))
+        self.assertFalse(_close_cid_burned("code 109415: contract paused"))
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────
 

@@ -3537,12 +3537,41 @@ def _hedge_position_side(direction):
     raise ValueError(f"cannot derive hedge positionSide from direction: {direction!r}")
 
 
-def _close_client_order_id(symbol=None):
-    """Deterministic clientOrderId for a CLOSE intent, bound to the trade id.
+_CLOSE_CID_NONCE = [0]
 
-    The same close intent always maps to the same clientOrderId so a confirm
-    timeout can reconcile the exact idempotency key on the venue before any
-    retry is considered (never a blind, possibly-double-closing retry).
+
+def _next_close_nonce():
+    """Monotonic, in-process nonce so two close orders issued within the same
+    millisecond can never share a clientOrderId token."""
+    _CLOSE_CID_NONCE[0] = (_CLOSE_CID_NONCE[0] + 1) % 100000
+    return _CLOSE_CID_NONCE[0]
+
+
+def _close_cid_burned(error):
+    """True when the venue rejected a clientOrderId because it was already used.
+
+    BingX permanently registers every clientOrderId that ever touched the
+    platform (error 101400 "clientOrderID unique check failed"); a burned key
+    can never be resurrected, not even after the order it belonged to filled.
+    """
+    m = str(error)
+    return "101400" in m or "unique check" in m or "clientOrderID" in m
+
+
+def _close_client_order_id(symbol=None, purpose="C", nonce=None):
+    """Unique clientOrderId for a CLOSE order, traceable to the trade id.
+
+    BingX permanently registers every clientOrderId that ever touched the
+    platform: deterministic ids made ANY reuse - a second close intent, a
+    confirm-timeout pass, or a restarted session recovering the same trade_id -
+    fail forever with 101400 "clientOrderID unique check failed".  Each close
+    order therefore carries a freshness nonce, and the PURPOSE tag keeps the
+    partial ("P"), full ("C") and remainder ("R") close keys disjoint.
+
+    Confirm-timeout reconciliation still maps the EXACT id each attempt sent
+    (see _reconcile_close_timeout), and a burned-id rejection proves nothing
+    filled under that fresh key, so rotating to the next nonce is a definite
+    rejection, never a blind possibly-double-closing retry.
     """
     tid = str(STATE.get("trade_id") or "").strip()
     if not tid:
@@ -3550,10 +3579,13 @@ def _close_client_order_id(symbol=None):
             .replace("/", "-").replace(":", "-")
         tid = f"{sym_raw}-{int(float(STATE.get('entry_time') or time.time()))}"
     tid = tid.replace("-", "_")
-    # "BARON_" (6) + tid + "_CLOSE" (6) must stay <=40: keep the unique TAIL
-    # (trade token) rather than the head when trimming, so two long trade_ids
-    # sharing a symbol prefix can never collapse into the same close key.
-    return f"BARON_{tid[-28:]}_CLOSE"[:40]
+    if nonce is None:
+        nonce = _next_close_nonce()
+    # "BARON_" (6) + tid tail + "_" + purpose + "_" + ts+nonce token stays <=40
+    # while keeping the trade token long enough that distinct trades never
+    # collapse into overlapping keys.
+    ts_token = f"{int(time.time() * 1000) % 100000:05d}{int(nonce) % 10000:04d}"
+    return f"BARON_{tid[-22:]}_{str(purpose)[0].upper()}_{ts_token}"[:40]
 
 
 def _synthetic_close_record_from_order(order, symbol, close_cid, expected_qty=None):
@@ -3687,9 +3719,10 @@ def close_partial(ratio):
         side = "sell" if STATE["side"] == "BUY" else "buy"
         sym = normalize_symbol(symbol)
         qty_precise = float(ex.amount_to_precision(sym, qty_to_close))
-        # Deterministic per-close-intent clientOrderId: a timeout reconciliation
-        # can look the exact idempotency key up BEFORE any retry is considered.
-        close_cid = _close_client_order_id(symbol)
+        # Unique per-close clientOrderId (purpose "P" - never shared with the
+        # full-close key, whose id this partial fill would otherwise burn on
+        # the venue). A confirm-timeout reconciliation maps this exact id.
+        close_cid = _close_client_order_id(symbol, purpose="P")
         order = safe_api_call(
             ex.create_order, sym, "market", side, qty_precise,
             params={"positionSide": _hedge_position_side(STATE["side"]),
@@ -3811,20 +3844,40 @@ def close_position_full():
         sym = normalize_symbol(symbol)
         qty_precise = float(ex.amount_to_precision(sym, qty_to_close))
 
-        # Deterministic per-close-intent clientOrderId: timeouts are reconciled by
-        # this exact idempotency key BEFORE any retry — a blind retry after a
-        # real fill would flip the position in Hedge Mode. The id stays stable
-        # across rejections (safe: rejected orders filled nothing on the venue).
-        close_cid = _close_client_order_id(symbol)
-
+        # Unique fresh clientOrderId per attempt: BingX permanently registers
+        # every clientOrderId that ever touched the venue (a prior partial
+        # close, confirm-timeout retry, or restarted recovery of the same trade
+        # burns "BARON_<tid>_CLOSE" forever -> error 101400 "clientOrderID
+        # unique check failed"). Reconciliation always maps the EXACT id each
+        # attempt sent, and a burned-id rejection proves nothing filled under
+        # that fresh key, so rolling to a new id is never a double close of the
+        # same contracts.
         for attempt in range(3):
+            close_cid = _close_client_order_id(
+                symbol, purpose="C", nonce=attempt + 1)
             params = {"positionSide": _hedge_position_side(STATE["side"]),
                       "clientOrderId": close_cid}
-            order = safe_api_call(ex.create_order, sym, "market", side,
-                                  qty_precise, params=params)
+            try:
+                order = safe_api_call(ex.create_order, sym, "market", side,
+                                      qty_precise, params=params)
+            except Exception as e:
+                if _close_cid_burned(e):
+                    # The id is dead on the venue, but no order was ever
+                    # accepted under THIS fresh key: rolling is a definite
+                    # rejection, not a blind retry of an unknown fill.
+                    log_execution(
+                        f"[CLOSE] clientOrderId burned on venue ({close_cid}); "
+                        f"rolling a fresh key (attempt {attempt + 1})", "WARN")
+                else:
+                    log_execution(
+                        f"[CLOSE] Order creation failed (attempt {attempt + 1}): "
+                        f"{e}", "ERROR")
+                time.sleep(1)
+                continue
             if order is None or not order.get('id'):
                 # Definite rejection (create_order answered, no order accepted):
-                # nothing may have executed, so retrying the SAME key is safe.
+                # nothing may have executed under THIS key. The next attempt
+                # rolls a brand-new id, so continuing is safe.
                 log_execution(
                     f"[CLOSE] Order creation rejected (attempt {attempt+1}, "
                     f"cid={close_cid})", "ERROR")
@@ -3854,7 +3907,8 @@ def close_position_full():
                         "WARN")
                     qty_to_close = current_qty
                     qty_precise = float(ex.amount_to_precision(sym, qty_to_close))
-                    close_cid = (_close_client_order_id(symbol) + "_R")[:40]
+                    close_cid = _close_client_order_id(
+                        symbol, purpose="R", nonce=attempt + 1)
                     continue
             else:
                 # CONFIRM TIMEOUT: the close may have executed and we cannot
@@ -3883,7 +3937,8 @@ def close_position_full():
             order = safe_api_call(ex.create_order, sym, "market", side,
                                   qty_precise,
                                   params={"positionSide": _hedge_position_side(STATE["side"]),
-                                          "clientOrderId": close_cid})
+                                          "clientOrderId": _close_client_order_id(
+                                              symbol, purpose="E", nonce=_next_close_nonce())})
             if order:
                 time.sleep(2)
                 pos = fetch_position(symbol)
