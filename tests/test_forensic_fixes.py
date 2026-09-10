@@ -12,7 +12,10 @@ Locks in, through the real ExecutionQueue methods:
   8. Every execute_entry rejection writes a structured {blocker, ...} record.
   9. Institutional metadata survives queue admission (fast-path contract).
  10. The institutional fast-path is actually reachable -> READY.
- 11. Candidate latency / lifecycle timestamps are recorded.
+ 11. Deep-scanner PREPARED candidates confirm via live retest (RETEST_CONFIRMED)
+     and reach READY with a single confirmed event; unmatched setups still
+     require two confirmations.
+ 12. Candidate latency / lifecycle timestamps are recorded.
  12. Risk/capacity/cooldown protections are never weakened.
  13. A rejected entry never creates a ghost paper position.
  14. No duplicate entries: an already-EXECUTED candidate is not re-offered.
@@ -331,7 +334,76 @@ class ForensicFixesTest(unittest.TestCase):
         self.assertEqual(cand.ready_blocker, "NONE")
         self.assertGreater(cand.ready_time, 0)
 
-    # ---- 11. Candidate latency / lifecycle recorded ----
+    # ---- 11. Deep-scanner PREPARED setup gets live-retest confirmation credit ----
+    def test_prepared_retest_confirmed_trigger_state(self):
+        """PHASE:COMPRESSION setups never produce MSS/BOS/sweep breakouts, so a
+        PREPARED candidate must be able to confirm via a live retest-with-
+        rejection at the causal zone (RETEST_CONFIRMED) — while the SAME market
+        data without the prepared flag stays unconfirmed."""
+        E = self.engine
+        q = E.ExecutionQueue()
+        with unittest.mock.patch(
+            "core.engine.RejectionIntelligence.is_bullish_rejection",
+            return_value=(True, ["retest_demo"])):
+            state = q._detect_trigger_state(_flat_df(), "BUY", 1.0, 100.0, prepared=True)
+        self.assertEqual(state, "RETEST_CONFIRMED")
+        with unittest.mock.patch(
+            "core.engine.RejectionIntelligence.is_bullish_rejection",
+            return_value=(True, ["retest_demo"])):
+            state_plain = q._detect_trigger_state(_flat_df(), "BUY", 1.0, 100.0, prepared=False)
+        self.assertNotEqual(state_plain, "RETEST_CONFIRMED")
+
+    def test_prepared_candidate_readies_with_single_confirmation(self):
+        """A matured (>=2-precursor) institutional setup reaches READY with ONE
+        live confirmed retest event; all other gates still enforced."""
+        E = self.engine
+        ac = E.AssetBehaviorProfile.entry_config(
+            E.AssetBehaviorProfile.resolve_asset_class("PRP/USDT:USDT"))
+        q = E.ExecutionQueue()
+        cand = _base_candidate(E, "PRP/USDT:USDT")
+        cand.institutional_prepared = True
+        cand.precursor_count = 2
+        cand.confirmation_count = 1
+        cand.confirmation_state = "CONFIRMED_1"
+        cand.zone_low, cand.zone_high = 99.0, 101.0
+        cand.zone_state = "RETEST"
+        cand.latest_adx = float(ac["min_adx"]) + 2.0
+        cand.latest_adx_bounds = [float(ac["min_adx"]), float(ac["max_adx"])]
+        cand.zone_metrics = E.ZoneMetrics(
+            order_block_quality=90, zone_strength=90, liquidity_quality=80,
+            institutional_confidence=85, structure_alignment=85,
+            entry_timing=90, trend_alignment=90, risk_score=90,
+            trigger_state="RETEST_CONFIRMED")
+        cand.evidence = {"sweep_quality": "strong", "rejection_or_displacement": True}
+        q._update_state(cand, 100.0)
+        self.assertEqual(cand.state, E.ExecutionState.READY)
+        self.assertEqual(cand.decision_label, "PREPARED_CONFIRMED")
+        self.assertEqual(cand.ready_blocker, "NONE")
+
+    def test_unprepared_candidate_needs_two_confirmations(self):
+        """An identical setup WITHOUT the deep-scanner prepared verdict still
+        requires two confirmed events — the credit never weakens normal gate."""
+        E = self.engine
+        ac = E.AssetBehaviorProfile.entry_config(
+            E.AssetBehaviorProfile.resolve_asset_class("NPR/USDT:USDT"))
+        q = E.ExecutionQueue()
+        cand = _base_candidate(E, "NPR/USDT:USDT")
+        cand.confirmation_count = 1
+        cand.zone_low, cand.zone_high = 99.0, 101.0
+        cand.zone_state = "RETEST"
+        cand.latest_adx = float(ac["min_adx"]) + 2.0
+        cand.latest_adx_bounds = [float(ac["min_adx"]), float(ac["max_adx"])]
+        cand.zone_metrics = E.ZoneMetrics(
+            order_block_quality=90, zone_strength=90, liquidity_quality=80,
+            institutional_confidence=85, structure_alignment=85,
+            entry_timing=90, trend_alignment=90, risk_score=90,
+            trigger_state="RETEST_CONFIRMED")
+        cand.evidence = {"sweep_quality": "strong", "rejection_or_displacement": True}
+        q._update_state(cand, 100.0)
+        self.assertNotEqual(cand.state, E.ExecutionState.READY)
+        self.assertEqual(cand.ready_blocker, "CONFIRMATION")
+
+    # ---- 12. Candidate latency / lifecycle recorded ----
     def test_lifecycle_timestamps_recorded(self):
         E = self.engine
         q = E.ExecutionQueue()

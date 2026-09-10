@@ -167,7 +167,7 @@ class EvidenceWiringTest(unittest.TestCase):
         q.add_candidate(cand)
         # Stub the trigger to a confirming state and the evidence constant so
         # both polls observe the SAME event.
-        q._detect_trigger_state = lambda d, s, a, e: "MSS_CONFIRMED"
+        q._detect_trigger_state = lambda d, s, a, e, prepared=False: "MSS_CONFIRMED"
         q._last_evidence = {"sweep_quality": "strong", "structure_score": 6, "rejection_score": 2, "absorption": 70}
         q.re_evaluate_all(lambda s: df)
         c = q._candidates.get("T2/USDT:USDT")

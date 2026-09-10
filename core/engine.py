@@ -12735,6 +12735,13 @@ def promote_to_queue():
         cand.ob_grade = str(analysis.get("ob_grade", "NONE"))
         cand.strong_ob_present = cand.ob_grade in ("A+", "A")
         cand.is_a_grade = bool(entry.get("a_grade_ready"))
+        # Transport the deep-scanner maturity verdict onto the queue candidate so
+        # the live READY machine can credit a matured institutional setup with a
+        # single confirmed retest instead of waiting for two breakout candles
+        # that never fire during PHASE:COMPRESSION accumulation.
+        cand.institutional_prepared = bool(entry.get("institutional_prepared"))
+        cand.precursor_count = int(entry.get("precursor_count") or zentry.get("precursor_count") or 0)
+        cand.a_grade_ready = bool(entry.get("a_grade_ready"))
         cand.priority_score = float(zentry.get("institutional_score", 0) or 0) + float(zentry.get("composite_score", 0) or 0) * 0.5
         cand.decision_reasons.append(
             "A-GRADE" if cand.is_a_grade else
@@ -14739,9 +14746,11 @@ class ExecutionQueue:
                 timing_score = self._evaluate_timing(df, cand.side, atr, current_price, cand.entry_price)
                 trend_score = self._evaluate_trend_alignment(df, cand.side)
                 risk_score = self._evaluate_risk(cand, current_price)
-                trigger_state = self._detect_trigger_state(df, cand.side, atr, cand.entry_price)
+                trigger_state = self._detect_trigger_state(
+                    df, cand.side, atr, cand.entry_price,
+                    prepared=bool(cand.institutional_prepared and int(cand.precursor_count) >= 1))
                 cand.evidence = dict(self._last_evidence)
-                confirm_triggers = ("MSS_CONFIRMED", "LIQUIDITY_SWEEP", "BOS_CONFIRMED", "CHOCH_CONFIRMED")
+                confirm_triggers = ("MSS_CONFIRMED", "LIQUIDITY_SWEEP", "BOS_CONFIRMED", "CHOCH_CONFIRMED", "RETEST_CONFIRMED")
                 # ---- PERSISTENT CONFIRMATION STATE MACHINE (forensic RC#1) ----
                 # Confirmation is earned over DISTINCT valid events/candles (candle
                 # identity + trigger + sweep target + price-bucket signature). A
@@ -15589,7 +15598,7 @@ class ExecutionQueue:
             return InstitutionalBehaviour.RE_DISTRIBUTION
         return InstitutionalBehaviour.NEUTRAL
 
-    def _detect_trigger_state(self, df, side, atr, entry_price):
+    def _detect_trigger_state(self, df, side, atr, entry_price, prepared=False):
         if not is_valid_dataframe(df):
             return "WAITING_TRIGGER"
         ev = {"sweep_quality": "none", "structure_valid": False, "structure_score": 0,
@@ -15656,6 +15665,16 @@ class ExecutionQueue:
             state = "BOS_CONFIRMED"
         elif choch_ok and displacement_ok and structure_confirmed:
             state = "CHOCH_CONFIRMED"
+        elif prepared and (rejection_ok or displacement_ok) and near_entry:
+            # Live retest-with-rejection at the causal zone for a DEEP-SCANNER
+            # PREPARED setup (>=2 institutional precursors already validated
+            # during watchlist analysis). During PHASE:COMPRESSION the market
+            # accumulates at support with rejection candles but produces no
+            # MSS/BOS/sweep breakout on the 15m timeframe, so the legacy
+            # confirmed-trigger set stayed empty for hours. This is the SAME
+            # institutional evidence the deep scanner already graded STRONG —
+            # now honoured as a confirmable live event.
+            state = "RETEST_CONFIRMED"
         elif sweep_shape and not structure_confirmed:
             state = "MITIGATION"
         elif near_entry and structure_confirmed:
@@ -16134,7 +16153,7 @@ class ExecutionQueue:
         label, composite, trap_risk = self._classify_decision(cand)
         cand.decision_label = label
         evidence_ok = not label.startswith("INVALID")
-        trigger_gate = trigger in ("MSS_CONFIRMED", "LIQUIDITY_SWEEP", "BOS_CONFIRMED", "CHOCH_CONFIRMED")
+        trigger_gate = trigger in ("MSS_CONFIRMED", "LIQUIDITY_SWEEP", "BOS_CONFIRMED", "CHOCH_CONFIRMED", "RETEST_CONFIRMED")
 
         # READY score floor is the class-aware ready threshold. The legacy PASS
         # floor (65) flags a structurally viable zone; READY additionally demands
@@ -16155,6 +16174,17 @@ class ExecutionQueue:
         if self._is_a_grade(cand):
             min_confirmations = 1
             cand.decision_label = "A_GRADE_FAST"
+        elif (cand.institutional_prepared and int(cand.precursor_count) >= 1
+                and cand.confirmation_count >= 1):
+            # Deep-scanner PREPARED setups (>=2 independent institutional
+            # precursors, STRONG grade, active causal zone) are already matured
+            # by watchlist analysis; one live confirmed event (RETEST_CONFIRMED
+            # or a breakout-class trigger) completes the READY contract instead
+            # of demanding two post-breakout candles that never fire while price
+            # accumulates in COMPRESSION. All score/ADX/ATOM/zone/evidence gates
+            # below remain fully enforced.
+            min_confirmations = 1
+            cand.decision_label = "PREPARED_CONFIRMED"
         else:
             min_confirmations = 2
             if cand.confirmation_count >= 2:
@@ -16241,7 +16271,7 @@ class ExecutionQueue:
         if cand.state in (ExecutionState.WAITING_TRIGGER, ExecutionState.GOOD_ZONE) and not cand.confirmation_logged:
             cand.confirmation_logged = True
             log_execution(f"[CONFIRMATION] {cand.symbol} waiting for trigger (zone_state={cand.zone_state})", "INFO")
-        confirmed_triggers = ("MSS_CONFIRMED", "LIQUIDITY_SWEEP", "BOS_CONFIRMED", "CHOCH_CONFIRMED")
+        confirmed_triggers = ("MSS_CONFIRMED", "LIQUIDITY_SWEEP", "BOS_CONFIRMED", "CHOCH_CONFIRMED", "RETEST_CONFIRMED")
         if trigger in confirmed_triggers and not cand.expansion_logged:
             cand.expansion_detected_time = time.time()
             cand.expansion_logged = True
@@ -16261,7 +16291,7 @@ class ExecutionQueue:
                     and evidence_ok and atom_gate_ok and adx_ok):
                 was_ready = cand.state == ExecutionState.READY
                 cand.state = ExecutionState.READY
-                cand.confirmation_state = "CONFIRMED_2"
+                cand.confirmation_state = "CONFIRMED_2" if min_confirmations >= 2 else "CONFIRMED_1"
                 cand.confirmation_reason = "CONFIRMATION_COMPLETE"
                 cand.ready_blocker = "NONE"
                 cand.ready_blocker_reasons = {}
@@ -16370,7 +16400,7 @@ class ExecutionQueue:
                 if c.state not in (ExecutionState.EXECUTED, ExecutionState.INVALIDATED,
                                    ExecutionState.RETURNED_WATCHLIST)
                 and getattr(getattr(c, "zone_metrics", None), "trigger_state", None)
-                in ("MSS_CONFIRMED", "LIQUIDITY_SWEEP", "BOS_CONFIRMED", "CHOCH_CONFIRMED")
+                in ("MSS_CONFIRMED", "LIQUIDITY_SWEEP", "BOS_CONFIRMED", "CHOCH_CONFIRMED", "RETEST_CONFIRMED")
             ]
             if not eligible:
                 return None
