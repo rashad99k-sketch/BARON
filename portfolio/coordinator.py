@@ -364,6 +364,11 @@ class TradeExecutionCoordinator:
                 # repeated partials must never over-subtract from a shrunk
                 # remainder and accidentally finalize an open runner.
                 remaining_before = trade.remaining_qty
+                # Only a scope written BY THIS call is authoritative: direct
+                # engine_partial calls (or stubs bypassing _scoped_engine_call)
+                # leave the previous call's snapshot untouched, and that stale
+                # scope must never size this leg.
+                _scope_before = getattr(self.engine, "_last_partial_scope", None)
                 # Execute partial close via engine
                 if engine_partial:
                     success = engine_partial(ratio)
@@ -373,25 +378,70 @@ class TradeExecutionCoordinator:
                     success = False
 
                 if success:
-                    close_qty = remaining_before * ratio
-                    close_qty = max(0.0, min(close_qty, remaining_before))
+                    # ── Reconciled leg sizing (unified 50/50 authority) ──
+                    # The engine is the ONLY authority over the closed size.
+                    # The scoped engine call persists its post-call STATE in
+                    # `_last_partial_scope` (the finally block restores the
+                    # pristine snapshot before this code runs, so reading
+                    # engine.STATE directly gives the wrong pre-call value).
+                    # Fall back to the live STATE when no snapshot exists
+                    # (harness stubs that bypass _scoped_engine_call).
+                    engine_remaining = remaining_before
+                    _scope = getattr(self.engine, "_last_partial_scope", None)
+                    if _scope is not None and _scope is _scope_before:
+                        # Stale snapshot from an earlier scoped call: this call
+                        # produced no scope, so never trust it.
+                        _scope = None
+                    if _scope and isinstance(_scope, dict):
+                        er = float(_scope.get("remaining_qty", remaining_before) or remaining_before)
+                    elif self.engine and hasattr(self.engine, "STATE"):
+                        er = float(self.engine.STATE.get("remaining_qty", remaining_before) or remaining_before)
+                    else:
+                        er = remaining_before
+                    if 0.0 <= er <= remaining_before + 1e-12:
+                        engine_remaining = er
+                    actual_delta = max(0.0, remaining_before - engine_remaining)
+                    if actual_delta > 1e-12:
+                        close_qty = min(actual_delta, remaining_before)
+                    else:
+                        close_qty = max(0.0, min(remaining_before * ratio, remaining_before))
                     close_price = trade.mark_price if trade.mark_price > 0 else trade.entry_price
                     # The engine already reduced the remaining size on the
                     # ledger; this leg is the bookkeeping mirror only.
-                    # We still deduct here so the Trade is the single source
-                    # of truth even with a non-mutating (fake) engine; the
-                    # scoped engine read-back reconciles the true remainder
-                    # on top in the real flow.
                     leg = trade.add_partial_leg(
                         close_qty, close_price, exit_reason.value,
                         adjust_remaining=False,
                     )
-                    trade.remaining_qty = max(0.0, remaining_before - close_qty)
+                    if engine_remaining < remaining_before - 1e-12:
+                        # Engine confirmed the REAL post-close size -> authority.
+                        trade.remaining_qty = max(0.0, engine_remaining)
+                    else:
+                        # Engine ledger untouched (defensive / harness stub):
+                        # fall back to the ratio math so the mirror never
+                        # disagrees with the leg it just booked.
+                        trade.remaining_qty = max(0.0, remaining_before - close_qty)
+                    # Mirror the single-authority TP-phase marker (verified fill
+                    # only) onto the persistent Trade entity.  Read from the
+                    # scope snapshot when available so the TP-phase flags reflect
+                    # the engine's TRUE state (post-call), not the pristine
+                    # snapshot restored by _scoped_engine_call.
+                    _tp_scope = _scope if _scope and isinstance(_scope, dict) else None
+                    if ratio < 1 and self.engine and hasattr(self.engine, "STATE"):
+                        _src = _tp_scope or self.engine.STATE
+                        if str(_src.get("tp1_state") or "NONE") == "EXECUTED":
+                            trade.tp1_state = "EXECUTED"
+                            trade.tp1_fill_qty = float(
+                                _src.get("tp1_fill_qty") or close_qty)
+                            trade.tp1_exec_price = float(
+                                _src.get("tp1_exec_price") or close_price)
+                            trade.tp1_event_ts = float(
+                                _src.get("tp1_event_ts") or 0.0)
                     if self.engine:
                         self.engine.log_execution(
                             f"[COORDINATOR] Partial close {trade.symbol} "
                             f"leg={leg.leg_id} qty={close_qty:.4f} "
-                            f"pnl={leg.realized_pnl_pct:.2f}%",
+                            f"pnl={leg.realized_pnl_pct:.2f}% "
+                            f"(actual delta {actual_delta:.6f})",
                             "SUCCESS",
                         )
                     # Check if fully closed after partial
@@ -606,6 +656,23 @@ class TradeExecutionCoordinator:
             # Reconstruct state from journal if available
             if trade_journal:
                 self._reconstruct_from_journal(trade, trade_journal)
+
+            # ── INITIAL SIZING reconstruction (unified 50/50 phase model) ──
+            # The journal's partial legs represent the ONLY realized closes for
+            # this recovered position. The exchange position size is the RUNNER
+            # remainder, so the true INITIAL size must be reconstructed as
+            #   initial = venue_remaining + sum(partial legs qty)
+            # instead of assuming the venue size is the original (which would
+            # make TP1 re-size off a shrunk runner on the next management tick).
+            _legs_total = sum(float(l.qty or 0.0) for l in trade.partial_legs)
+            if _legs_total > 0 and trade.remaining_qty >= 0:
+                trade.original_qty = max(trade.remaining_qty, trade.original_qty)
+                trade.original_qty = trade.remaining_qty + _legs_total
+            if trade.tp1_hit and trade.tp1_fill_qty <= 0:
+                # Best reconstruction of the single TP1 fill from the legs.
+                tp1_legs = [float(l.qty or 0.0) for l in trade.partial_legs]
+                if tp1_legs:
+                    trade.tp1_fill_qty = max(tp1_legs)
 
             # Compute SL/TP from current ATR if engine available
             if self.engine:

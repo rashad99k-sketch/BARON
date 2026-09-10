@@ -526,6 +526,15 @@ class PortfolioManager:
                         pass
                 result = fn()
                 self._read_back_state(trade, engine.STATE, mirror_legs=False)
+                # Persist the post-call scoped state so the coordinator can
+                # read back the engine's TRUE remaining/tp1 markers.  The
+                # finally block restores the original pristine STATE, which
+                # erases the real outcome; the coordinator reads this dict
+                # to size the bookkeeping leg as an exact mirror of the
+                # engine authority, never falling back to stale ratio math.
+                _scope_snap = dict(engine.STATE)
+                _scope_snap["_ts"] = time.time()
+                setattr(engine, "_last_partial_scope", _scope_snap)
                 if result and not engine.STATE.get("open") and trade.is_active:
                     self._book_closed_from_scope(trade, engine.STATE)
                 return result
@@ -562,10 +571,35 @@ class PortfolioManager:
 
         if updated.get("tp1_hit") or str(updated.get("tp1_state", "")).upper() == "EXECUTED":
             trade.tp1_state = "EXECUTED"
+            # TP-phase model: persist the verified single TP1 fill (never infer
+            # a fill from intent). If the engine recorded numbers, mirror them.
+            try:
+                _fill = float(updated.get("tp1_fill_qty", 0) or 0)
+                if _fill > 0:
+                    trade.tp1_fill_qty = _fill
+                else:
+                    # Best-effort reconstruction: initial size * tp1_ratio.
+                    trade.tp1_fill_qty = min(
+                        float(trade.original_qty or 0.0) * float(trade.tp1_ratio or 0.5),
+                        float(trade.original_qty or 0.0),
+                    )
+                _xprice = float(updated.get("tp1_exec_price", 0) or 0)
+                if _xprice > 0:
+                    trade.tp1_exec_price = _xprice
+                _ets = float(updated.get("tp1_event_ts", 0) or 0)
+                if _ets > 0:
+                    trade.tp1_event_ts = _ets
+            except (TypeError, ValueError):
+                pass
         if updated.get("tp2_hit") or str(updated.get("tp2_state", "")).upper() == "EXECUTED":
             trade.tp2_state = "EXECUTED"
+            _ets2 = float(updated.get("tp2_event_ts", 0) or 0)
+            if _ets2 > 0:
+                trade.tp2_event_ts = _ets2
         if updated.get("trail_activated"):
             trade.protection_state = ProtectionState.TRAILING
+        if updated.get("profit_lock_activated"):
+            trade.protection_state = ProtectionState.PROFIT_LOCK
         # Mirror engine-booked partial legs into the Trade so a LATER full
         # close (scoped finalize) subtracts their realised value from the
         # session realised total instead of crediting it twice.
@@ -1116,11 +1150,57 @@ def canonical_position_payload(symbol: str, s: dict, asset_class: Optional[str] 
         "realized_roe_pct": float(s.get("realized_roe_pct", 0.0) or 0.0),
         "realized_legs": int(s.get("realized_legs", 0) or 0),
         "tp1_state": s.get("tp1_state"),
+        "tp1_ratio": float(s.get("tp1_ratio", 0.5) or 0.5),
+        "tp1_hit": bool(s.get("tp1_hit", False)),
         "tp1_exec_price": float(s.get("tp1_exec_price", 0.0) or 0.0),
+        "tp1_fill_qty": float(s.get("tp1_fill_qty", 0.0) or 0.0),
         "tp1_event_ts": s.get("tp1_event_ts"),
         "tp2_state": s.get("tp2_state"),
+        "tp2_hit": bool(s.get("tp2_hit", False)),
         "tp2_event_ts": s.get("tp2_event_ts"),
+        "trailing_active": bool(s.get("trail_activated", False)),
         "trail_activation_ts": s.get("trail_activation_ts"),
+        "profit_lock_active": bool(
+            str(s.get("protection_state", "")).upper() in ("PROFIT_LOCK", "TRAILING")
+            or bool(s.get("profit_lock_activated", False))
+            or bool(s.get("trail_activated", False))
+        ),
+        # === Unified 50/50 TP-phase model (derived, presentation only) ===
+        "initial_size": float(s.get("qty_initial") or s.get("qty") or 0.0),
+        "initial_size_pct": 100.0,
+        "tp1_close_pct": round(float(s.get("tp1_ratio", 0.5) or 0.5) * 100.0, 2),
+        "tp1_status": "DONE" if str(s.get("tp1_state", "")).upper() == "EXECUTED"
+                      else "WAITING",
+        "runner_size": max(0.0, float(s.get("qty_initial") or 0.0)
+                           * (1.0 - float(s.get("tp1_ratio", 0.5) or 0.5))),
+        "runner_pct": round((1.0 - float(s.get("tp1_ratio", 0.5) or 0.5)) * 100.0, 2),
+        "runner_status": (
+            "DONE" if float(s.get("remaining_qty", 0.0) or 0.0) <= 0
+            else "ACTIVE") if str(s.get("tp1_state", "")).upper() == "EXECUTED"
+            else "PENDING_TP1",
+        "tp2_close_pct": round(
+            ((float(s.get("remaining_qty", 0.0) or 0.0)
+              / float(s.get("qty_initial") or 1.0)) * 100.0)
+            if float(s.get("qty_initial") or 0.0) > 0 else 0.0, 2),
+        "tp2_status": ("DONE" if str(s.get("tp2_state", "")).upper() == "EXECUTED"
+                       else "ACTIVE") if (str(s.get("tp1_state", "")).upper() == "EXECUTED"
+                                          and float(s.get("remaining_qty", 0.0) or 0.0) > 0)
+                       else "WAITING",
+        "management_posture": (
+            "EXIT" if s.get("exit_warning") or s.get("thesis_failure_score", 0) >= 60
+            else "PROTECT" if (str(s.get("protection_state", "")).upper() in ("PROFIT_LOCK", "TRAILING")
+                               or s.get("exit_warning"))
+            else "RIDE TREND"
+        ),
+        "trade_phase": "TP2" if str(s.get("tp1_state", "")).upper() == "EXECUTED"
+                       else "TP1",
+        "runner_active": bool(str(s.get("tp1_state", "")).upper() == "EXECUTED"
+                              and float(s.get("remaining_qty", 0.0) or 0.0) > 0),
+        "price_targets": {
+            "tp1": tp1,
+            "tp2": tp2,
+            "entry": round(entry, 6),
+        },
         "native_sl_state": s.get("native_sl_state"),
         "native_sl_price": float(s.get("native_sl_price", 0.0) or 0.0),
         "position_status": s.get("position_status"),

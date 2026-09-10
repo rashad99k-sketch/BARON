@@ -679,6 +679,8 @@ function updateUI(d) {{
             <div>Entry: ${{d.position.entry}} | Unrealized PnL: <span class="${{pnlClass}}">${{pnlUsdt.toFixed(2)}} USDT</span> (ROE <span class="${{pnlClass}}">${{roeV.toFixed(2)}}%</span>)</div>
             <div>SL: ${{d.position.sl}} | TP1: ${{d.position.tp1}} | TP2: ${{d.position.tp2}}</div>
             <div>TP1: ${{d.position.tp1_done ? "done" : "pending"}} | Stage: <b>${{stage}}</b> | Protection: <b>${{prot}}</b></div>
+            <div><b>🎯 PROFIT PHASE (50/50):</b> Initial 100% | TP1 ${{Number(d.position.tp1_close_pct || 0).toFixed(0)}}% (<b>${{d.position.tp1_status || "WAITING"}}</b>) | Runner ${{Number(d.position.runner_pct || 0).toFixed(0)}}% <b>${{d.position.runner_status || "PENDING_TP1"}}</b> | TP2 remaining ${{Number(d.position.tp2_close_pct || 0).toFixed(1)}}% <b>${{d.position.tp2_status || "WAITING"}}</b></div>
+            <div><b>Profit Lock:</b> ${{d.position.profit_lock_active ? "ACTIVE" : "INACTIVE"}} | <b>Management:</b> ${{d.position.management_posture || "RIDE TREND"}}</div>
             <div>Realized: <span class="${{rlzCls}}">${{rlzUsdt.toFixed(2)}} USDT (${{Number(d.position.realized_pnl_pct || 0).toFixed(2)}}%)</span> | Legs: ${{d.position.realized_legs || 0}} | TradeId: ${{d.position.trade_id || "-"}}</div>
             <div>Location: ${{d.position.location}} | Zone: ${{d.position.zone}}</div>
             <div>Narrative: ${{d.position.narrative_classification}} (Conf: ${{d.position.narrative_confidence}}) | Conf Level: ${{d.position.confidence_level}}</div>
@@ -1066,6 +1068,33 @@ def data():
                     "tp1": round(STATE.get("synthetic_tp1",0),4),
                     "tp2": round(STATE.get("tp2_price",0),4),
                     "tp1_done": STATE.get("tp1_hit", False),
+                    "tp1_hit": STATE.get("tp1_hit", False),
+                    "tp1_close_pct": round(float(STATE.get("tp1_ratio", 0.5) or 0.5) * 100.0, 2),
+                    "tp1_status": "DONE" if str(STATE.get("tp1_state", "")).upper() == "EXECUTED" else "WAITING",
+                    "runner_pct": round((1.0 - float(STATE.get("tp1_ratio", 0.5) or 0.5)) * 100.0, 2),
+                    "runner_status": ("DONE" if float(STATE.get("remaining_qty", 0.0) or 0.0) <= 0
+                                      else "ACTIVE") if str(STATE.get("tp1_state", "")).upper() == "EXECUTED"
+                                      else "PENDING_TP1",
+                    "runner_active": bool(str(STATE.get("tp1_state", "")).upper() == "EXECUTED"
+                                          and float(STATE.get("remaining_qty", 0.0) or 0.0) > 0),
+                    "tp2_close_pct": round(
+                        ((float(STATE.get("remaining_qty", 0.0) or 0.0)
+                          / float(STATE.get("qty_initial") or 1.0)) * 100.0)
+                        if float(STATE.get("qty_initial") or 0.0) > 0 else 0.0, 2),
+                    "tp2_status": ("DONE" if str(STATE.get("tp2_state", "")).upper() == "EXECUTED"
+                                   else "ACTIVE") if (str(STATE.get("tp1_state", "")).upper() == "EXECUTED"
+                                                      and float(STATE.get("remaining_qty", 0.0) or 0.0) > 0)
+                                   else "WAITING",
+                    "profit_lock_active": bool(
+                        str(STATE.get("protection_state", "")).upper() in ("PROFIT_LOCK", "TRAILING")
+                        or STATE.get("profit_lock_activated", False)
+                        or STATE.get("trail_activated", False)),
+                    "management_posture": (
+                        "EXIT" if STATE.get("exit_warning") or STATE.get("thesis_failure_score", 0) >= 60
+                        else "PROTECT" if (str(STATE.get("protection_state", "")).upper() in ("PROFIT_LOCK", "TRAILING")
+                                           or STATE.get("exit_warning"))
+                        else "RIDE TREND"),
+                    "initial_size": float(STATE.get("qty_initial") or STATE.get("qty") or 0.0),
                     "trailing_active": STATE.get("trail_activated", False),
                     "regime": MEMORY.get("regime", "UNKNOWN"),
                     "trade_type": STATE.get("trade_type"),

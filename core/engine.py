@@ -64,6 +64,7 @@
 # ====================================================================
 
 import os
+import re
 import time
 import json
 import threading
@@ -3607,7 +3608,10 @@ def _close_client_order_id(symbol=None, purpose="C", nonce=None):
         sym_raw = str(STATE.get("current_symbol") or symbol or "?")\
             .replace("/", "-").replace(":", "-")
         tid = f"{sym_raw}-{int(float(STATE.get('entry_time') or time.time()))}"
-    tid = tid.replace("-", "_")
+    # BingX clientOrderId charset is [A-Za-z0-9_-]; trade ids may embed
+    # ":" and "/" (e.g. "TRADE:BTC/USDT:unit") — normalise every unsafe
+    # character so close keys always match the venue charset and stay <=40.
+    tid = re.sub(r"[^A-Za-z0-9_]", "_", tid)
     if nonce is None:
         nonce = _next_close_nonce()
     # "BARON_" (6) + tid tail + "_" + purpose + "_" + ts+nonce token stays <=40
@@ -3701,7 +3705,44 @@ def _reconcile_close_timeout(symbol, direction, close_cid, expected_qty, expecte
         return False
 
 
+def _tp1_executed(state: dict) -> bool:
+    """True only after TP1 was actually executed and VERIFIED on the venue."""
+    return str(state.get("tp1_state") or "NONE") == "EXECUTED"
+
+
+def _mark_tp1_executed(state: dict, fill_qty, exec_price) -> None:
+    """Mark TP1 as executed ONLY after fill verification / reconciliation.
+
+    This is the single place that flips the TP-phase gate. Runner partials
+    become impossible once this marker is set.
+    """
+    state["tp1_state"] = "EXECUTED"
+    state["tp1_fill_qty"] = float(fill_qty or 0.0)
+    state["tp1_exec_price"] = float(exec_price or 0.0)
+    state["tp1_event_ts"] = time.time()
+    state["tp1_hit"] = True
+    state["runner_mode"] = True
+    state["profit_stage"] = "TP1_EXECUTED"
+    log_execution(
+        f"[TP_PHASE] TP1 executor verified: fill_qty={state['tp1_fill_qty']:.6f} "
+        f"@ {state['tp1_exec_price']:.6f} | runner locked at 50%, "
+        f"runner partials BLOCKED", "SUCCESS")
+
+
 def close_partial(ratio):
+    """Close a fraction of the position — the ONLY partial-close authority.
+
+    Unified 50/50 two-phase profit taking:
+      * TP1 = exactly ``tp1_ratio`` (default 0.5) of the INITIAL position,
+        executed ONCE and NEVER repeated. ``tp1_state`` only flips to
+        EXECUTED after actual venue/paper fill verification (or proven
+        timeout reconciliation) — never on local intent alone.
+      * After TP1 the position is the RUNNER. Runner partials (ratio<1)
+        are BLOCKED by the TP-phase gate: the only runner exits are TP2
+        (full close of the remainder) or a strict-close full exit.
+      * Every partial books a ledger leg, re-reads the venue position, and
+        reconciles the actual remaining quantity.
+    """
     global _closing_in_progress, _reconciliation_pending
     if _closing_in_progress:
         log_execution("[CLOSE_PARTIAL] Already closing, skipping", "WARN")
@@ -3713,12 +3754,47 @@ def close_partial(ratio):
     _reconciliation_pending = True
     _ok = False
     try:
+        remaining0 = float(STATE.get("remaining_qty", 0.0) or 0.0)
+        qty_init = float(STATE.get("qty_initial") or STATE.get("qty") or remaining0 or 0.0)
+        if remaining0 <= 0:
+            log_execution("[CLOSE_PARTIAL] No remaining quantity to close", "WARN")
+            return False
+        tp1_ratio = float(STATE.get("tp1_ratio", 0.5) or 0.5)
+        is_tp1_partial = 0.0 < float(ratio or 0.0) < 1.0
+        if is_tp1_partial:
+            if _tp1_executed(STATE):
+                log_execution(
+                    f"[TP_PHASE] RUNNER PROTECTED: partial close ratio={ratio} "
+                    f"REJECTED after TP1 already executed (TP1 fill "
+                    f"{STATE.get('tp1_fill_qty', 0.0):.6f}). Runner can only "
+                    f"close via TP2 full close or strict exit.", "WARN")
+                if STATE.get("diagnostics", None) is None:
+                    STATE["diagnostics"] = []
+                STATE["diagnostics"].append({
+                    "ts": time.time(),
+                    "event": "runner_partial_blocked",
+                    "ratio": ratio, "remaining": remaining0,
+                })
+                return False
+            qty_target = min(qty_init * tp1_ratio, remaining0)
+            if qty_target <= 0:
+                log_execution("[CLOSE_PARTIAL] No quantity to close (TP1 target empty)", "WARN")
+                return False
+            log_execution(
+                f"[TP_PHASE] TP1 target = min(initial={qty_init:.6f} * "
+                f"{tp1_ratio:.2f}, remaining={remaining0:.6f}) = "
+                f"{qty_target:.6f}", "INFO")
+        else:
+            # ratio>=1 (or non-fraction) = close the WHOLE remainder (TP2 /
+            # runner full close). Never TP1.
+            qty_target = remaining0
+            is_tp1_partial = False
+
         if PAPER_MODE:
             if paper["position"]:
                 entry = STATE.get("entry", 0.0) or 0.0
-                qty_init = STATE.get("qty", 0.0) or 0.0
-                closed_qty = STATE["remaining_qty"] * ratio
                 side_u = STATE.get("side")
+                closed_qty = qty_target
                 mark = get_ticker_safe(STATE.get("current_symbol")) or STATE.get("mark_price") or entry
                 dirv = 1 if side_u == "BUY" else -1
                 pnl_pct_leg = dirv * (mark - entry) / entry * 100 if entry else 0.0
@@ -3735,19 +3811,21 @@ def close_partial(ratio):
                 released = STATE["margin"] * (closed_qty / qty_init) if qty_init > 0 else 0.0
                 paper["balance"] = paper.get("balance", 10000.0) + pnl_usdt_leg + released
                 paper["committed_margin"] = max(0.0, paper.get("committed_margin", 0.0) - released)
-                log_execution(f"[CLOSE_PARTIAL] Paper partial close {ratio*100:.0f}% | leg PnL {pnl_pct_leg:+.2f}%/{pnl_usdt_leg:+.2f} USDT | margin released {released:.2f}", "SUCCESS")
+                if is_tp1_partial:
+                    _mark_tp1_executed(STATE, closed_qty, mark)
+                _pct_of_init = qty_target / qty_init * 100 if qty_init > 0 else 0.0
+                log_execution(f"[CLOSE_PARTIAL] Paper partial close {closed_qty:.6f} ({_pct_of_init:.0f}% of initial) | leg PnL {pnl_pct_leg:+.2f}%/{pnl_usdt_leg:+.2f} USDT | margin released {released:.2f}", "SUCCESS")
                 _ok = True
             return _ok
 
         symbol = STATE["current_symbol"]
-        qty_to_close = STATE["remaining_qty"] * ratio
-        if qty_to_close <= 0:
-            log_execution("[CLOSE_PARTIAL] No quantity to close", "WARN")
-            return False
-
+        qty_to_close = qty_target
         side = "sell" if STATE["side"] == "BUY" else "buy"
         sym = normalize_symbol(symbol)
         qty_precise = float(ex.amount_to_precision(sym, qty_to_close))
+        if qty_precise <= 0:
+            log_execution("[CLOSE_PARTIAL] Precision rounds target to zero", "WARN")
+            return False
         # Unique per-close clientOrderId (purpose "P" - never shared with the
         # full-close key, whose id this partial fill would otherwise burn on
         # the venue). A confirm-timeout reconciliation maps this exact id.
@@ -3806,6 +3884,8 @@ def close_partial(ratio):
                     DASHBOARD_STATE["live_trade_mode"] = False
                     finalize_trade_with_reality(symbol)
             _exchange_sync.reconcile(symbol, STATE)
+            if is_tp1_partial:
+                _mark_tp1_executed(STATE, filled_qty, fill_price)
             _ok = True
         else:
             log_execution(f"[CLOSE_PARTIAL] Partial close failed to verify ({close_cid})", "ERROR")
@@ -3815,8 +3895,8 @@ def close_partial(ratio):
             if _reconcile_close_timeout(symbol, STATE["side"], close_cid, qty_precise,
                                         expected=expected_remaining):
                 log_execution(
-                    f"[CLOSE_PARTIAL] Recovery proved the partial close filled "
-                    f"({close_cid}); booking leg at mark", "INFO")
+                    f"[CLOSE_PARTIAL] Recovery PROVED the partial close filled "
+                    f"({close_cid}); booking leg at mark and reconciling", "INFO")
                 time.sleep(1)
                 pos = fetch_position(symbol)
                 if pos is None:
@@ -3826,8 +3906,23 @@ def close_partial(ratio):
                 else:
                     STATE["remaining_qty"] = max(0.0, float(pos.get("contracts", 0.0)))
                     TRADE_STATE["qty"] = STATE["remaining_qty"]
+                _booked_qty = min(qty_precise, STATE.get("remaining_qty", 0.0) + qty_precise)
+                _bk_price = float(STATE.get("mark_price") or STATE.get("entry") or 0.0)
+                _bk_p = float(STATE.get("entry", 0.0) or 0.0)
+                _bk_dir = 1 if STATE.get("side") == "BUY" else -1
+                _bk_pct = _bk_dir * (_bk_price - _bk_p) / _bk_p * 100 if _bk_p else 0.0
+                _bk_usdt = _bk_pct / 100 * _bk_p * _booked_qty
+                _record_partial_leg(STATE.get("side"), _booked_qty, _bk_price, _bk_p,
+                                    _bk_pct, _bk_usdt, "LIVE_RECOVERED")
+                if is_tp1_partial:
+                    _mark_tp1_executed(STATE, _booked_qty, _bk_price)
                 _exchange_sync.reconcile(symbol, STATE)
+                _ok = True
             else:
+                log_execution(
+                    f"[TP_PHASE] Close UNKNOWN after reconcile — NOT retailing, "
+                    f"NOT marking TP1 done. Remaining stays local until "
+                    f"recovery proves it.", "WARN")
                 _exchange_sync.reconcile(symbol, STATE)
     except Exception as e:
         log_execution(f"[CLOSE_PARTIAL] Error: {traceback.format_exc()}", "ERROR")
@@ -3855,6 +3950,10 @@ def close_position_full():
             symbol = STATE.get("current_symbol") or DEFAULT_SYMBOL
             paper["position"] = None
             finalize_trade_with_reality(symbol)
+            # Full close: the remainder is zero — a stale runner size after
+            # finalize would resurrect a phantom position on the next tick.
+            STATE["remaining_qty"] = 0.0
+            TRADE_STATE["qty"] = 0.0
             DASHBOARD_STATE["live_trade_mode"] = False
             log_execution("[CLOSE] Paper position closed", "SUCCESS")
             return True
@@ -3923,6 +4022,8 @@ def close_position_full():
                     STATE["open"] = False
                     TRADE_STATE["in_position"] = False
                     DASHBOARD_STATE["live_trade_mode"] = False
+                    STATE["remaining_qty"] = 0.0
+                    TRADE_STATE["qty"] = 0.0
                     finalize_trade_with_reality(symbol)
                     return True
                 current_qty = float(pos.get('contracts', 0))
@@ -3952,6 +4053,8 @@ def close_position_full():
                     STATE["open"] = False
                     TRADE_STATE["in_position"] = False
                     DASHBOARD_STATE["live_trade_mode"] = False
+                    STATE["remaining_qty"] = 0.0
+                    TRADE_STATE["qty"] = 0.0
                     finalize_trade_with_reality(symbol)
                     return True
                 log_execution(
@@ -3975,6 +4078,8 @@ def close_position_full():
                     STATE["open"] = False
                     TRADE_STATE["in_position"] = False
                     DASHBOARD_STATE["live_trade_mode"] = False
+                    STATE["remaining_qty"] = 0.0
+                    TRADE_STATE["qty"] = 0.0
                     finalize_trade_with_reality(symbol)
                     log_execution("[CLOSE] Emergency close succeeded", "SUCCESS")
                     return True
@@ -4861,14 +4966,16 @@ class LiveTradeManager:
             STATE["thesis_failure_score"] = failure_score
             if failed:
                 log_execution(f"[THESIS_FAILURE] Thesis failed for {symbol}: {failure_reasons}", "WARN")
-                if roe > 0:
-                    close_partial(0.5)
-                    STATE["synthetic_sl"] = entry
-                else:
-                    close_position_full()
-                    self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
-                    DASHBOARD_STATE["live_trade_mode"] = False
-                    return
+                # Unified 50/50 model: a thesis failure is evidence-severe enough
+                # for a STRICT exit. Runner partials are banned — the whole
+                # remaining position is closed through the strict-close
+                # pipeline, never a de-risk ratio on the runner.
+                STATE["close_reason"] = "STRICT_CLOSE_THESIS_FAILURE"
+                STATE["exit_reason"] = "THESIS_FAILURE"
+                close_position_full()
+                self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
+                DASHBOARD_STATE["live_trade_mode"] = False
+                return
 
             old_conf = STATE.get("current_confidence", 50.0)
             di_spread_change = (plus_di - minus_di) - STATE.get("prev_di_spread", 0)
@@ -5000,6 +5107,12 @@ class LiveTradeManager:
                         _tj.TP1_EXECUTED, symbol=symbol, side=side,
                         reason=f"aggressive profit-lock TP1 partial filled roe={roe:.2f}%",
                         state=STATE, level="SUCCESS",
+                        metadata={
+                            "tp1_exec_price": STATE.get("tp1_exec_price", 0.0),
+                            "tp1_fill_qty": STATE.get("tp1_fill_qty", 0.0),
+                            "tp1_ratio": STATE.get("tp1_ratio", 0.5),
+                            "initial_qty": float(STATE.get("qty_initial") or STATE.get("qty") or 0.0),
+                        },
                     )
                 else:
                     _journal_trade_event(
@@ -5084,7 +5197,13 @@ class LiveTradeManager:
                         _tj.TP1_EXECUTED, symbol=symbol, side=side,
                         reason=f"TP1 partial close FILLED at {roe:.2f}% ROE (hold_score={tp1_hold_score})",
                         state=STATE, level="SUCCESS",
-                        metadata={"hold_score": tp1_hold_score, "roe": round(roe, 3)},
+                        metadata={
+                            "hold_score": tp1_hold_score, "roe": round(roe, 3),
+                            "tp1_exec_price": STATE.get("tp1_exec_price", 0.0),
+                            "tp1_fill_qty": STATE.get("tp1_fill_qty", 0.0),
+                            "tp1_ratio": STATE.get("tp1_ratio", 0.5),
+                            "initial_qty": float(STATE.get("qty_initial") or STATE.get("qty") or 0.0),
+                        },
                     )
                     _apply_protection_ratchet(symbol=symbol, mark_price=mark_price,
                                               side=side, entry=entry, atr=atr,
@@ -5857,22 +5976,35 @@ def decision_engine(scenario, rf_signal, adx):
     return "SKIP"
 
 def apply_profit_engine(symbol, current_price, df, idx, position_state):
-    if not position_state["open"]:
+    """Legacy MATRIX-style profit engine, now aligned with the unified 50/50 model.
+
+    WARNING: this is a test/simulation convenience only — it is NOT a live
+    authority. Every actual close it triggers is delegated to the ONE and only
+    profit-taking executor: ``close_partial(0.5)`` for TP1 (50% of INITIAL,
+    verified fill, marked executed once) and ``close_position_full()`` for TP2
+    (full runner close through the strict-close pipeline). Runner partials are
+    never generated here.
+    """
+    if not position_state.get("open"):
         return "HOLD"
-    side = position_state["side"]
-    entry = position_state["entry"]
-    remaining = position_state["remaining_qty"]
+    side = position_state.get("side")
+    entry = position_state.get("entry", 0.0) or 0.0
+    remaining = float(position_state.get("remaining_qty", 0.0) or 0.0)
+    qty_init = float(position_state.get("qty_initial")
+                     or position_state.get("qty")
+                     or remaining or 0.0)
     pnl_pct = (current_price - entry) / entry * 100 if side == "BUY" else (entry - current_price) / entry * 100
-    if not position_state.get("tp1_hit", False) and pnl_pct >= 0.5:
-        close_ratio = 0.3
-        close_qty = remaining * close_ratio
-        if close_qty > 0:
-            if PAPER_MODE:
-                position_state["remaining_qty"] -= close_qty
-                TRADE_STATE["qty"] = position_state["remaining_qty"]
+    tp1_done = (str(position_state.get("tp1_state") or "NONE") == "EXECUTED"
+                or bool(position_state.get("tp1_hit", False)))
+    if not tp1_done and pnl_pct >= 0.5:
+        tp1_target = min(qty_init * 0.5, remaining)
+        if tp1_target > 0:
+            if position_state is STATE:
+                close_partial(0.5)  # single verified authority (TP1 = 50% of initial)
             else:
-                close_partial(close_ratio)
-            log_execution(f"TP1 hit at {pnl_pct:.2f}% - closed {close_ratio*100:.0f}%", "SUCCESS")
+                position_state["remaining_qty"] = max(0.0, remaining - tp1_target)
+                TRADE_STATE["qty"] = position_state["remaining_qty"]
+            log_execution(f"TP1 hit at {pnl_pct:.2f}% - banked 50% of initial (once)", "SUCCESS")
             tg_tp_hit(symbol, 1, pnl_pct)
         position_state["tp1_hit"] = True
         position_state["sl"] = entry
@@ -5883,18 +6015,17 @@ def apply_profit_engine(symbol, current_price, df, idx, position_state):
         else:
             position_state["trail_stop"] = current_price + TRAIL_ATR_MULT * atr_val
         return "TP1"
-    if position_state.get("tp1_hit", False) and not position_state.get("tp2_hit", False) and pnl_pct >= 1.2:
-        close_ratio = 0.3
-        close_qty = position_state["remaining_qty"] * close_ratio
-        if close_qty > 0:
-            if PAPER_MODE:
-                position_state["remaining_qty"] -= close_qty
-                TRADE_STATE["qty"] = position_state["remaining_qty"]
+    if tp1_done and not position_state.get("tp2_hit", False) and pnl_pct >= 1.2:
+        if remaining > 0:
+            if position_state is STATE:
+                close_position_full()  # TP2 = FULL runner close via strict pipeline
             else:
-                close_partial(close_ratio)
-            log_execution(f"TP2 hit at {pnl_pct:.2f}% - closed {close_ratio*100:.0f}%", "SUCCESS")
+                position_state["remaining_qty"] = 0.0
+                TRADE_STATE["qty"] = 0.0
+            log_execution(f"TP2 hit at {pnl_pct:.2f}% - full runner close", "SUCCESS")
             tg_tp_hit(symbol, 2, pnl_pct)
         position_state["tp2_hit"] = True
+        position_state["tp2_state"] = "EXECUTED"
         return "TP2"
     if len(df) >= 2 and idx >= 1:
         adx_series = compute_adx(df)

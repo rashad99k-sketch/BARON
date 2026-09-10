@@ -11,9 +11,10 @@ core.engine instance:
            fields the execution layer consumes (price, asset_class, side).
   Part 2 - those RADAR candidates (2 CRYPTO / 2 INDEX / 1 GOLD) plus the
            independent NEWS slot open six positions on the real entry path.
-  Part 3 - REAL profit taking: apply_profit_engine books TP1 (30% partial,
-           SL to breakeven, trail armed) then TP2 (second partial), and
-           finalize_trade_with_reality releases margin and books the win.
+  Part 3 - REAL profit taking: apply_profit_engine drives the unified 50/50
+           phase model — TP1 banks exactly 50% of the INITIAL size (SL to
+           breakeven, trail armed) then TP2 closes the ENTIRE runner through
+           the strict-close pipeline, releasing margin and booking the win.
   Part 4 - manage_all() runs the real position-management loop over the six
            slots (sync + live management + council exits) without corrupting
            the portfolio; freed slots leave room for the next radar rotation.
@@ -395,32 +396,37 @@ class RadarPositionLifecycleTest(unittest.TestCase):
             entry = float(self.pm.contexts["BTC/USDT:USDT"].state["entry"])
             qty0 = E.STATE["remaining_qty"]
             df = _frame(base=entry)
-            # TP1: +0.6% > the 0.5% profit-engine bar -> partial + breakeven.
-            self.assertEqual(E.apply_profit_engine("BTC/USDT:USDT", entry * 1.006,
+            # Live mark for the paper ledger: mutable so TP1 and TP2 each book
+            # their true realized PnL (TP1 banks at +0.6%, runner closes at +1.5%).
+            tick = {"v": entry}
+            E.get_ticker_safe = lambda symbol, retries=3: (
+                tick["v"] if str(symbol).startswith("BTC") else _ticker(symbol))
+            # TP1: +0.6% > the 0.5% profit-engine bar -> banks 50% once.
+            tick["v"] = entry * 1.006
+            E.STATE["mark_price"] = tick["v"]
+            self.assertEqual(E.apply_profit_engine("BTC/USDT:USDT", tick["v"],
                                                    df, len(df) - 1, E.STATE), "TP1")
             self.assertTrue(E.STATE["tp1_hit"])
+            self.assertEqual(str(E.STATE.get("tp1_state")), "EXECUTED")
             self.assertLess(E.STATE["remaining_qty"], qty0)
             self.assertAlmostEqual(E.STATE["sl"], entry, places=3)  # breakeven
             self.assertTrue(E.STATE["trail_activated"])
             qty1 = E.STATE["remaining_qty"]
-            self.assertAlmostEqual(qty1, qty0 * 0.7, places=6)
-            # TP2: second 30% partial.
-            self.assertEqual(E.apply_profit_engine("BTC/USDT:USDT", entry * 1.015,
+            # Unified 50/50 model: TP1 banks exactly 50% of the INITIAL size.
+            self.assertAlmostEqual(qty1, qty0 * 0.5, places=6)
+            # Mark the runner deep in profit for a truthful strict-close finalize.
+            tick["v"] = entry * 1.015
+            E.STATE["mark_price"] = tick["v"]
+            # TP2 = the ENTIRE runner closes (no second partial).
+            self.assertEqual(E.apply_profit_engine("BTC/USDT:USDT", tick["v"],
                                                    df, len(df) - 1, E.STATE), "TP2")
             self.assertTrue(E.STATE["tp2_hit"])
-            self.assertLess(E.STATE["remaining_qty"], qty1)
-            # Real finalize: mark in profit, then book margin release + win.
-            margin_committed = E.paper["committed_margin"]
-            balance0 = E.paper["balance"]
-            E.STATE["mark_price"] = entry * 1.015
-            E.get_ticker_safe = lambda symbol, retries=3: (
-                entry * 1.015 if str(symbol).startswith("BTC") else _ticker(symbol))
-            pnl_usdt, pnl_pct = E.finalize_trade_with_reality("BTC/USDT:USDT")
-            self.assertGreater(pnl_pct, 1.0)
-            self.assertGreater(pnl_usdt, 0.0)
+            self.assertAlmostEqual(E.STATE["remaining_qty"], 0.0, places=6)
             self.assertFalse(E.STATE.get("open"))
-            self.assertLess(E.paper["committed_margin"], margin_committed)
-            self.assertGreater(E.paper["balance"], balance0)
+            self.assertGreater(E.PERF["total_pnl_pct"], 1.0)
+            self.assertGreater(E.PERF["total_pnl_usdt"], 0.0)
+            self.assertLess(E.paper["committed_margin"], 1000.0)
+            self.assertGreater(E.paper["balance"], 10000.0)
             self.assertEqual(E.PERF["trades"], 1)
             self.assertEqual(E.PERF["wins"], 1)
             self.assertEqual(E.PERF["losses"], 0)

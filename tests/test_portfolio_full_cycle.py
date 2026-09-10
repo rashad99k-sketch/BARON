@@ -10,10 +10,12 @@ established T4 test convention.
   Part 2 - the real portfolio management loop (manage_all: sync_position_state
            + live management + council exit) runs without corrupting the
            portfolio; contexts keep their live managers and snapshot() is real.
-  Part 3 - REAL profit taking: apply_profit_engine books TP1 (30% close, SL to
-           breakeven, trail armed) and TP2 (second 30% close), then
-           finalize_trade_with_reality releases margin, books realized PnL +
-           win in PAPER_MODE and the closed context is reaped by manage_all.
+  Part 3 - REAL profit taking: apply_profit_engine drives the unified 50/50
+           phase model — TP1 banks exactly 50% of the INITIAL size (SL to
+           breakeven, trail armed), TP2 closes the ENTIRE runner through the
+           strict-close pipeline, releasing margin and booking realized PnL +
+           win in PAPER_MODE; the closed context is reaped by manage_all.
+           Runner partials are forbidden after TP1.
 """
 import os
 import types
@@ -322,39 +324,42 @@ class ProfitTakingRealPathTest(unittest.TestCase):
         finally:
             self.pm.deactivate()
 
-    def test_tp2_books_second_partial_then_finalize_releases_and_reaps(self):
+    def test_tp2_closes_runner_and_releases_and_reaps(self):
         entry = self._open_buy("BTC/USDT:USDT", "CRYPTO")
         self.pm.activate("BTC/USDT:USDT")
         try:
             qty0 = E.STATE["remaining_qty"]
             df = _frame(base=entry)
-            self.assertEqual(E.apply_profit_engine("BTC/USDT:USDT", entry * 1.006,
+            # Live mark for the paper ledger: mutable so TP1 and TP2 each book
+            # their true realized PnL (TP1 banks at +0.6%, runner closes at +1.5%).
+            tick = {"v": entry}
+            E.get_ticker_safe = lambda symbol, retries=3: (
+                tick["v"] if str(symbol).startswith("BTC")
+                else float(_price(symbol)))
+            tick["v"] = entry * 1.006
+            E.STATE["mark_price"] = tick["v"]
+            self.assertEqual(E.apply_profit_engine("BTC/USDT:USDT", tick["v"],
                                                    df, len(df) - 1, E.STATE), "TP1")
             qty1 = E.STATE["remaining_qty"]
-            self.assertAlmostEqual(qty1, qty0 * 0.7, places=6)
-            self.assertEqual(E.apply_profit_engine("BTC/USDT:USDT", entry * 1.015,
+            # Unified 50/50 model: TP1 banks exactly 50% of the INITIAL size.
+            self.assertAlmostEqual(qty1, qty0 * 0.5, places=6)
+            # Mark the runner deep in profit BEFORE TP2 so the runner's
+            # strict-close finalize books the trade with the real exit price.
+            tick["v"] = entry * 1.015
+            E.STATE["mark_price"] = tick["v"]
+            # TP2 = the ENTIRE runner exits through the strict-close pipeline
+            # (full close, finalize included — never a second partial).
+            self.assertEqual(E.apply_profit_engine("BTC/USDT:USDT", tick["v"],
                                                    df, len(df) - 1, E.STATE), "TP2")
             self.assertTrue(E.STATE["tp2_hit"])
-            self.assertLess(E.STATE["remaining_qty"], qty1)
-            margin_committed = E.paper["committed_margin"]
-            balance0 = E.paper["balance"]
-            # mark the price in profit, then the REAL finalize books the closed
-            # trade with reality: margin released + realized win in PERF.
-            E.STATE["mark_price"] = entry * 1.015
-            target_tick = entry * 1.015
-            E.get_ticker_safe = lambda symbol, retries=3: (
-                target_tick if str(symbol).startswith("BTC")
-                else float(_price(symbol)))
-            pnl_usdt, pnl_pct = E.finalize_trade_with_reality("BTC/USDT:USDT")
-            self.assertGreater(pnl_pct, 1.0)
-            self.assertGreater(pnl_usdt, 0)
             self.assertFalse(E.STATE.get("open"))
-            self.assertLess(E.paper["committed_margin"], margin_committed)
-            self.assertGreater(E.paper["balance"], balance0)
+            self.assertAlmostEqual(E.STATE["remaining_qty"], 0.0, places=6)
+            self.assertLess(E.paper["committed_margin"], 1000.0)
+            self.assertGreater(E.paper["balance"], 10000.0)
             self.assertEqual(E.PERF["trades"], 1)
             self.assertEqual(E.PERF["wins"], 1)
             self.assertEqual(E.PERF["losses"], 0)
-            self.assertGreaterEqual(E.PERF["total_pnl_usdt"], 0)
+            self.assertGreater(E.PERF["total_pnl_pct"], 1.0)
         finally:
             self.pm.deactivate()
         # The management loop reaps the closed context and the slot frees.

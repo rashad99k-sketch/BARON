@@ -22,7 +22,7 @@ from __future__ import annotations
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from core.trade import Trade, TradeStatus
+from core.trade import ProtectionState, Trade, TradeStatus
 from portfolio.trade_council import CouncilMemberVote, TradeDecision
 
 
@@ -498,7 +498,53 @@ def render_position_board(trade: Trade,
                       f"{_protected_roe(trade):+.2f}%" if _protected_roe(trade) is not None else "— (none)"))
     runner = trade.remaining_ratio * 100.0 if trade.original_qty > 0 else 0.0
     lines.append(_two("RUNNER", f"{runner:.0f}% of position"))
+    lines += _profit_phase_rows(trade, ctx)
     return _ProBox.render(f"📊 POSITION BOARD  {trade.symbol}", lines)
+
+
+def _profit_phase_rows(trade: Trade, ctx: Optional[Any] = None) -> List[str]:
+    """The unified 50/50 two-phase profit-taking block.
+
+    INITIAL 100% → TP1 banks 50% once (verified) → RUNNER rides trend →
+    TP2 closes the remaining 50%. Runner partials are forbidden.
+    """
+    snap = trade.tp_phase_snapshot()
+    side_label = f"{_direction(trade)} ({trade.side})" if trade.side else "-"
+    rows: List[str] = []
+    rows.append(_sep("🎯 PROFIT PHASE (50/50)"))
+    rows.append(_two("POSITION", side_label))
+    rows.append(_two("INITIAL SIZE",
+                     f"100% ({float(snap['initial_size']):.6f})"))
+    rows.append(_two("TP1 50%",
+                     f"{snap['tp1_status']} (closed {float(snap['tp1_fill_qty']):.6f})"))
+    rows.append(_two("RUNNER 50%",
+                     f"{snap['runner_status']} ({float(snap['runner_qty']):.6f})"))
+    rows.append(_two("TP2 (runner)",
+                     f"{snap['tp2_status']} → remaining {float(snap['tp2_qty']):.6f} ({snap['tp2_pct']:.1f}%)"))
+    rows.append(_two("PROFIT LOCK", snap["profit_lock"]))
+    rows.append(_two("MANAGEMENT", _profit_management_label(trade, ctx)))
+    return rows
+
+
+def _profit_management_label(trade: Trade, ctx: Optional[Any] = None) -> str:
+    """Management posture: RIDE TREND / PROTECT / EXIT (advisory only)."""
+    ctx = _board_ctx(trade) if ctx is None else ctx
+    if trade.status in (TradeStatus.CLOSED, TradeStatus.PARTIAL_CLOSE) and trade.remaining_qty <= 0:
+        return "EXIT"
+    if trade.tp2_state == "EXECUTED":
+        return "EXIT"
+    protecting = trade.protection_state in (
+        ProtectionState.PROFIT_LOCK, ProtectionState.TRAILING)
+    warnings = _warnings(ctx)
+    exit_wanted = _crisis_decision(trade, ctx, "PROTECT").startswith("FULL") if warnings else False
+    thesis_bad = float(getattr(ctx, "thesis_failure_score", 0) or 0) >= 60
+    if protecting and thesis_bad:
+        return "EXIT"
+    if protecting:
+        return "PROTECT"
+    if thesis_bad:
+        return "EXIT"
+    return "RIDE TREND"
 
 
 def render_risk_alert(trade: Trade, alert: str,

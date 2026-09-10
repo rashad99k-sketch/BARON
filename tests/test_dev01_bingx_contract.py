@@ -600,24 +600,32 @@ class PaperCloseSemanticsTest(unittest.TestCase):
         E.paper["position"] = {"qty": qty, "remaining_qty": qty, "side": side,
                                "entry": entry, "symbol": "BTC-USDT"}
 
-    def test_paper_partial_long_halves_remaining_twice(self):
+    def test_paper_partial_long_tp1_banks_once_runner_never_re_partials(self):
+        """Unified 50/50 phase model: TP1 banks 50% of INITIAL once; the second
+        fractional close (runner de-risk) is REJECTED by the TP-phase gate."""
         self._seed("BUY")
-        E.close_partial(0.5)
+        ok1 = E.close_partial(0.5)
+        self.assertTrue(ok1)
         self.assertAlmostEqual(float(E.STATE["remaining_qty"]), 0.5, places=6)
-        E.close_partial(0.5)
-        self.assertAlmostEqual(float(E.STATE["remaining_qty"]), 0.25, places=6)
-        self.assertAlmostEqual(float(E.paper["position"]["remaining_qty"]), 0.25,
+        self.assertEqual(str(E.STATE.get("tp1_state")), "EXECUTED")
+        self.assertAlmostEqual(float(E.STATE["tp1_fill_qty"]), 0.5, places=6)
+        ok2 = E.close_partial(0.5)
+        self.assertFalse(ok2, "runner partial after TP1 must be blocked")
+        self.assertAlmostEqual(float(E.STATE["remaining_qty"]), 0.5, places=6)
+        self.assertAlmostEqual(float(E.paper["position"]["remaining_qty"]), 0.5,
                                places=6, msg="paper venue must track post-close size")
 
-    def test_paper_partial_short_halves_remaining_twice(self):
+    def test_paper_partial_short_tp1_banks_once_runner_never_re_partials(self):
         self._seed("SELL", entry=3000.0)
         E.STATE["entry"] = 3000.0
         E.paper["position"]["entry"] = 3000.0
         E.get_ticker_safe = lambda symbol, retries=0, **k: 2940.0
-        E.close_partial(0.5)
+        ok1 = E.close_partial(0.5)
+        self.assertTrue(ok1)
         self.assertAlmostEqual(float(E.STATE["remaining_qty"]), 0.5, places=6)
-        E.close_partial(0.5)
-        self.assertAlmostEqual(float(E.STATE["remaining_qty"]), 0.25, places=6)
+        ok2 = E.close_partial(0.5)
+        self.assertFalse(ok2, "runner partial after TP1 must be blocked")
+        self.assertAlmostEqual(float(E.STATE["remaining_qty"]), 0.5, places=6)
 
     def test_paper_full_close_clears_position(self):
         self._seed("BUY")
@@ -631,12 +639,15 @@ class PaperCloseSemanticsTest(unittest.TestCase):
                                msg="finalize must zero the remaining qty after full close")
 
     def test_paper_never_over_closes_nor_reverses(self):
-        # no over-close: repeated partials never exceed the initial size and
-        # remaining never drops below 0; no reverse: side is never flipped.
+        # no over-close: the single TP1 partial plus the runner full close never
+        # exceed the initial size; remaining never drops below 0; the second
+        # fractional close is blocked; no reverse: side is never flipped.
         self._seed("BUY")
-        E.close_partial(0.5)
-        E.close_partial(0.5)
-        self.assertAlmostEqual(float(E.STATE["remaining_qty"]), 0.25, places=6)
+        ok1 = E.close_partial(0.5)
+        self.assertTrue(ok1)
+        ok2 = E.close_partial(0.5)
+        self.assertFalse(ok2, "runner partial after TP1 must be blocked")
+        self.assertAlmostEqual(float(E.STATE["remaining_qty"]), 0.5, places=6)
         self.assertGreaterEqual(float(E.STATE["remaining_qty"]), 0.0)
         self.assertEqual(E.STATE["side"], "BUY")
         E.finalize_trade_with_reality = lambda *a, **k: E.STATE.__setitem__("remaining_qty", 0.0)

@@ -151,21 +151,29 @@ class AccountingLifecycleTest(unittest.TestCase):
         self.assertAlmostEqual(e.paper["committed_margin"], 0.0)
         self.assertAlmostEqual(e.paper["balance"], 1410.0)
 
-    def test_two_partials_plus_final_accurate(self):
+    def test_runner_partial_blocked_then_full_close_accurate(self):
+        """Unified 50/50 phase model: TP1 banks 50% once; the second
+        fractional (runner) close is BLOCKED by the TP-phase gate; the
+        final close takes the whole 50% runner."""
         e = self.engine
         e.STATE["mark_price"] = 103.0
-        e.close_partial(0.5)  # 50 @ 103 -> 3% / 150 USDT
+        e.close_partial(0.5)  # TP1: 50 of INITIAL @ 103 -> 3% / 150 USDT
         self.assertAlmostEqual(e.STATE["remaining_qty"], 50.0)
+        self.assertEqual(str(e.STATE.get("tp1_state")), "EXECUTED")
+        self.assertAlmostEqual(e.STATE["tp1_fill_qty"], 50.0)
+        # second fractional close MUST be rejected — no runner partials.
         e.STATE["mark_price"] = 102.0
-        e.close_partial(0.5)  # 25 @ 102 -> 2% / 50 USDT
-        self.assertAlmostEqual(e.STATE["remaining_qty"], 25.0)
+        ok = e.close_partial(0.5)  # REJECTED by TP-phase gate
+        self.assertFalse(ok)
+        self.assertAlmostEqual(e.STATE["remaining_qty"], 50.0)
+        self.assertEqual(len(e.STATE["partial_realized"]), 1)
         e.STATE["mark_price"] = 106.0
-        e.finalize_trade_with_reality("BTC/USDT")  # 25 @ 106 -> 6% / 150 USDT
+        e.finalize_trade_with_reality("BTC/USDT")  # runner 50 @ 106 -> 6% / 300 USDT
         self.assertEqual(e.PERF["trades"], 1)
         self.assertEqual(e.PERF["wins"], 1)
-        self.assertAlmostEqual(e.PERF["total_pnl_usdt"], 350.0)
-        # size-weighted return: 350 USDT / (100 entry * 100 qty_initial) * 100
-        self.assertAlmostEqual(e.PERF["total_pnl_pct"], 3.5)
+        self.assertAlmostEqual(e.PERF["total_pnl_usdt"], 450.0)
+        # size-weighted return: 450 USDT / (100 entry * 100 qty_initial) * 100
+        self.assertAlmostEqual(e.PERF["total_pnl_pct"], 4.5)
         self.assertEqual(len(e.STATE["partial_realized"]), 0)  # reset on close
 
     def test_multi_symbol_ledger(self):

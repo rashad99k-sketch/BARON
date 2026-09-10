@@ -383,6 +383,28 @@ class GapReversalInstantCrashTest(unittest.TestCase):
         # harnesses see exactly the import-time singletons.
         self._orig_live_manager = E._live_manager
         self._orig_exchange_sync = E._exchange_sync
+        self._orig_bus = E._event_bus
+        # Async event-bus shutdown: LiveTradeManager._force_close runs on the
+        # module EventBus daemon worker and calls close_position_full() against
+        # WHATEVER global STATE is current when the queued event is finally
+        # processed. A force_close_local queued by an EARLIER test file in the
+        # same pytest process has fired a phantom full-close finalize (-10000,
+        # normalized symbol) mid-run here. A worker MID-HANDLER keeps running
+        # until it re-checks _running, so give it a real settle window BEFORE
+        # this test mutates global STATE: an in-flight close then sees
+        # "No position to close" and is harmless instead of finalizing a
+        # phantom trade mid-scenario. Also hand this test a brand-new isolated
+        # bus + worker so no foreign event can reach it after the swap.
+        try:
+            self._orig_bus.stop(join_timeout=20.0)
+        except Exception:
+            pass
+        try:
+            if self._orig_bus._thread is not None and self._orig_bus._thread.is_alive():
+                self._orig_bus._thread.join(timeout=25.0)
+        except Exception:
+            pass
+        E._event_bus = E.EventBus()
         E._live_manager = E.LiveTradeManager(E._event_bus, E._exchange_sync, E._recovery_guard)
         E._exchange_sync = E.ExchangeSyncService(E._event_bus)
         opened = self.pm.open_top([self._cand(c)], slots=1)
@@ -410,6 +432,14 @@ class GapReversalInstantCrashTest(unittest.TestCase):
                 pass
         E._live_manager = getattr(self, "_orig_live_manager", E._live_manager)
         E._exchange_sync = getattr(self, "_orig_exchange_sync", E._exchange_sync)
+        # Stop this test's isolated bus and restore a HEALTHY module bus for
+        # later files in the same process (the old import-time bus was stopped
+        # in setUp and may carry stale queued force-close events).
+        try:
+            E._event_bus.stop(join_timeout=0.5)
+        except Exception:
+            pass
+        E._event_bus = E.EventBus()
         try:
             if getattr(self, "_lifecycle_baseline", None) is not None:
                 E._live_manager.lifecycle_state = self._lifecycle_baseline
@@ -462,7 +492,8 @@ class GapReversalInstantCrashTest(unittest.TestCase):
         E.DASHBOARD_STATE.clear(); E.DASHBOARD_STATE.update(_dsnap)
         E.paper.update({"balance": 10000.0, "position": None, "committed_margin": 0.0})
         E.PERF.update({"trades": 0, "wins": 0, "losses": 0, "total_pnl_usdt": 0.0,
-                       "total_pnl_pct": 0.0, "last_trade": {}})
+                       "total_pnl_pct": 0.0, "last_trade": {},
+                       "symbols": {}})
         E.log_execution = lambda *a, **k: None
 
     def _cand(self, cand, score=85.0):

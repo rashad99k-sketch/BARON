@@ -359,12 +359,13 @@ class EngineTradeSafetyTest(unittest.TestCase):
 
     # ---- finalize: classified from REALIZED, not peak ----
     def test_finalize_classifies_from_realized_loses_despite_peak(self):
-        _open_paper(side="BUY", entry=100.0, qty=100.0, remaining=50.0, mark=102.0)
+        _open_paper(side="BUY", entry=100.0, qty=100.0, remaining=100.0, mark=102.0)
         E.STATE["entry_time"] = time.time() - 120
         E.STATE["trade_id"] = "TRADE:BTC/USDT:unit"
         with mock.patch.object(E, "get_ticker_safe", return_value=102.0):
-            E.close_partial(0.5)  # bank +2% on 50 -> realized +100 USDT
-        # Final runner closes BELOW entry so REALIZED is overall negative.
+            E.close_partial(0.5)  # TP1 banks +2% on 50 -> realized +100 USDT
+        # Final runner (the remaining 50) closes BELOW entry so REALIZED is
+        # overall negative — the split is 50/50, not repeated halving.
         with mock.patch.object(E, "get_ticker_safe", return_value=97.0):
             E._mark_close_reason("STOP_LOSS")
             pnl_usdt, pnl_pct = E.finalize_trade_with_reality("BTC/USDT")
@@ -452,6 +453,17 @@ class EngineTradeSafetyTest(unittest.TestCase):
 
     def test_reconcile_confirmed_absence_journals_external_close(self):
         emitted = []
+        saved_bus = E._exchange_sync.event_bus
+        # Route the emitted force-close onto a THROWAWAY bus and stop its
+        # worker at the end of THIS test. The long-lived module bus worker
+        # would otherwise process the queued force-close asynchronously AFTER
+        # this file ends, landing it against LATER test files' global STATE
+        # (a phantom full close mid-scenario). The verify here only needs the
+        # emitted payload + journal decision, never the async side effect.
+        try:
+            E._exchange_sync.event_bus = E.EventBus()
+        except Exception:
+            pass
         bus = E._exchange_sync.event_bus
         original_emit = bus.emit
         # reconcile is rate-limited to once per 10s; earlier suites may have
@@ -467,6 +479,11 @@ class EngineTradeSafetyTest(unittest.TestCase):
                     E._exchange_sync.reconcile("BTC/USDT", {"open": True, "side": "BUY"})
         finally:
             E._exchange_sync._last_reconcile = saved_last_reconcile
+            try:
+                E._exchange_sync.event_bus.stop(join_timeout=1.0)
+            except Exception:
+                pass
+            E._exchange_sync.event_bus = saved_bus
         sent = {et: d for et, d in emitted}
         self.assertEqual(sent.get("force_close_local", {}).get("symbol"), "BTC/USDT")
         dec = [r["decision"] for r in self._decisions()]

@@ -151,6 +151,13 @@ class Trade:
     remaining_qty: float = 0.0
     margin: float = 0.0
 
+    # === TP phase model (unified 50/50 profit taking) ===
+    # tp1_ratio: fraction of the INITIAL position banked by the single TP1
+    # event. After TP1 the remaining position is the RUNNER; the only valid
+    # profit-taking on the runner is TP2 (full close of the remainder) or a
+    # strict-close full exit. Runner partials are forbidden by design.
+    tp1_ratio: float = 0.5
+
     # === Protection levels (monotonic — never move backward) ===
     synthetic_sl: float = 0.0
     tp1_price: float = 0.0
@@ -259,6 +266,79 @@ class Trade:
     def realized_ratio(self) -> float:
         return 1.0 - self.remaining_ratio
 
+    # === TP phase model =====================================================
+    # Unified 50/50 two-phase profit taking:
+    #   TP1  -> banks a fixed fraction (tp1_ratio) of the INITIAL position.
+    #   RUNNER -> the exact remainder that keeps riding the trend.
+    #   TP2  -> closes the ENTIRE runner (no runner partials, ever).
+    # Original size is never mutated by profit-taking; remaining is derived.
+
+    @property
+    def tp1_target_qty(self) -> float:
+        """Size of the single TP1 close = ratio of the INITIAL position."""
+        if self.original_qty <= 0:
+            return 0.0
+        return round(float(self.original_qty) * float(self.tp1_ratio), 12)
+
+    @property
+    def runner_qty(self) -> float:
+        """Exact remainder after TP1 = the runner that rides the trend."""
+        return max(0.0, float(self.original_qty) - self.tp1_target_qty)
+
+    @property
+    def runner_active(self) -> bool:
+        """Runner exists and is still open right now."""
+        return self.tp1_hit and self.remaining_qty > 0
+
+    @property
+    def tp2_target_qty(self) -> float:
+        """TP2 must close the WHOLE runner — never a fraction of it."""
+        return self.remaining_qty
+
+    @property
+    def runner_ratio(self) -> float:
+        if self.original_qty <= 0:
+            return 0.0
+        return self.tp1_target_qty / self.original_qty * 0.0 + max(
+            0.0, 1.0 - float(self.tp1_ratio))
+
+    @property
+    def profit_lock_active(self) -> bool:
+        return self.protection_state in (
+            ProtectionState.PROFIT_LOCK, ProtectionState.TRAILING,
+        )
+
+    def tp_phase_snapshot(self) -> dict:
+        """Presentation snapshot for dashboard / board (50/50 phase model)."""
+        init = float(self.original_qty or 0.0)
+        if init <= 0:
+            init = float(self.remaining_qty or 0.0)
+        tp1_pct = float(self.tp1_ratio) * 100.0
+        runner_pct = max(0.0, 100.0 - tp1_pct)
+        rem_pct = (self.remaining_ratio * 100.0) if init > 0 else 0.0
+        return {
+            "initial_size": round(init, 8),
+            "initial_pct": 100.0,
+            "tp1_ratio": round(float(self.tp1_ratio), 4),
+            "tp1_pct": round(tp1_pct, 2),
+            "tp1_fill_qty": round(float(self.tp1_fill_qty), 8),
+            "tp1_state": self.tp1_state,
+            "tp1_status": "DONE" if self.tp1_hit else "WAITING",
+            "runner_qty": round(self.runner_qty, 8),
+            "runner_pct": round(runner_pct, 2),
+            "runner_status": ("DONE" if self.remaining_qty <= 0 else "ACTIVE")
+                             if self.tp1_hit else "PENDING_TP1",
+            "tp2_qty": round(self.tp2_target_qty, 8),
+            "tp2_pct": round(rem_pct, 2),
+            "tp2_state": self.tp2_state,
+            "tp2_status": "DONE" if self.tp2_state == "EXECUTED" else
+                          ("ACTIVE" if self.tp1_hit and self.remaining_qty > 0 else "WAITING"),
+            "profit_lock": "ACTIVE" if self.profit_lock_active else "INACTIVE",
+            "protection_state": self.protection_state.value,
+            "remaining_qty": round(float(self.remaining_qty), 8),
+            "remaining_pct": round(rem_pct, 2),
+        }
+
     def can_advance_stage(self, target: ProfitStage) -> bool:
         """Check if the trade can advance to the target profit stage."""
         stage_order = list(ProfitStage)
@@ -348,6 +428,11 @@ class Trade:
             "qty": self.original_qty,
             "remaining_qty": self.remaining_qty,
             "qty_initial": self.original_qty,
+            "tp1_ratio": float(self.tp1_ratio),
+            "tp1_target_qty": self.tp1_target_qty,
+            "runner_qty": self.runner_qty,
+            "runner_active": self.runner_active,
+            "tp2_target_qty": self.tp2_target_qty,
             "margin": self.margin,
             "mark_price": self.mark_price,
             "trade_id": self.trade_id,
@@ -453,6 +538,7 @@ class Trade:
             "entry_reason": self.entry_reason,
             "original_qty": self.original_qty,
             "remaining_qty": self.remaining_qty,
+            "tp1_ratio": float(self.tp1_ratio),
             "margin": self.margin,
             "synthetic_sl": self.synthetic_sl,
             "tp1_price": self.tp1_price,
@@ -551,6 +637,7 @@ class Trade:
             entry_reason=data.get("entry_reason", ""),
             original_qty=data.get("original_qty", 0.0),
             remaining_qty=data.get("remaining_qty", 0.0),
+            tp1_ratio=float(data.get("tp1_ratio", 0.5)),
             margin=data.get("margin", 0.0),
             synthetic_sl=data.get("synthetic_sl", 0.0),
             tp1_price=data.get("tp1_price", 0.0),
